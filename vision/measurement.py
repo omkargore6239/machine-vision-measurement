@@ -81,8 +81,14 @@ def build_measurement_records(
 
     for c in circles:
         prefix = f"Hole {c.circle_id}"
-        records.append(_record(f"{prefix} Diameter", "Holes", 2 * c.r, profile, confidence=c.confidence))
+        records.append(_record(f"{prefix} Equivalent Diameter", "Holes", 2 * c.r, profile, confidence=c.confidence))
         records.append(_record(f"{prefix} Radius", "Holes", c.r, profile, confidence=c.confidence))
+        if c.major_px is not None and c.minor_px is not None:
+            # An ellipse fit exists — report major/minor separately (a
+            # circular hole photographed at an angle can appear elliptical;
+            # see vision.geometry's hole-detection docstring).
+            records.append(_record(f"{prefix} Major Diameter", "Holes", c.major_px, profile, confidence=c.confidence))
+            records.append(_record(f"{prefix} Minor Diameter", "Holes", c.minor_px, profile, confidence=c.confidence))
 
         cx_mm_pt = convert_point_to_mm((c.cx, c.cy), origin, profile)
         cx_val = c.cx - origin[0]

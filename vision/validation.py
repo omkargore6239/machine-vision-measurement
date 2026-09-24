@@ -19,6 +19,16 @@ MAX_CLIPPED_FRACTION = 0.05
 # irregular part, but is also consistent with perspective skew.
 LOW_EXTENT_PERSPECTIVE_HINT = 0.55
 
+# Hard floors: below these, the image is unusable for ANY measurement, not
+# just lower-precision — these are "error" severity (blocking), unlike the
+# "warning" thresholds above (which still allow a measurement through).
+HARD_MIN_SHORT_SIDE_PX = 150
+HARD_BLUR_VARIANCE_THRESHOLD = 15.0
+
+# Segmentation reliability gate (used to refuse measurement outright).
+MIN_SEGMENTATION_EXTENT = 0.35
+MIN_PART_AREA_FRACTION_OF_IMAGE = 0.005
+
 
 def assess_image_quality(img: np.ndarray) -> QualityReport:
     gray = preprocessing.to_gray(img)
@@ -30,13 +40,23 @@ def assess_image_quality(img: np.ndarray) -> QualityReport:
 
     issues: list[QualityIssue] = []
 
-    if min(h, w) < MIN_SHORT_SIDE_PX:
+    if min(h, w) < HARD_MIN_SHORT_SIDE_PX:
+        issues.append(QualityIssue(
+            f"Image resolution ({w}x{h}px) is far too low for any reliable measurement.",
+            "error",
+        ))
+    elif min(h, w) < MIN_SHORT_SIDE_PX:
         issues.append(QualityIssue(
             f"Image resolution is low ({w}x{h}px). Measurement precision will be limited.",
             "warning",
         ))
 
-    if blur < BLUR_VARIANCE_THRESHOLD:
+    if blur < HARD_BLUR_VARIANCE_THRESHOLD:
+        issues.append(QualityIssue(
+            "Image is far too blurry for any reliable measurement.",
+            "error",
+        ))
+    elif blur < BLUR_VARIANCE_THRESHOLD:
         issues.append(QualityIssue(
             "Image may be too blurry for reliable measurement (low edge sharpness detected).",
             "warning",
@@ -65,6 +85,31 @@ def assess_image_quality(img: np.ndarray) -> QualityReport:
         "dark_fraction": dark_frac, "bright_fraction": bright_frac,
     }
     return QualityReport(issues=issues, metrics=metrics)
+
+
+def segmentation_is_reliable(part: DetectedPart | None, image_shape: tuple[int, int]) -> tuple[bool, str]:
+    """Hard gate: refuse to measure at all rather than report numbers built
+    on a boundary we don't trust. This is a stricter, blocking check on top
+    of the informational warnings in `assess_detection`."""
+    if part is None:
+        return False, "No part boundary could be detected in this image."
+
+    if part.touches_border:
+        return False, ("The part's outline touches the image border, so its true overall "
+                        "dimensions are unknown (it may extend beyond the frame). Retake the "
+                        "photo with the whole part visible.")
+
+    _, _, rw, rh, _ = part.rotated_rect
+    rotated_area = rw * rh
+    extent = part.area_px2 / rotated_area if rotated_area > 0 else 0.0
+    if extent < MIN_SEGMENTATION_EXTENT:
+        return False, f"The detected outline is too irregular to trust (only fills {extent:.0%} of its own bounding rectangle)."
+
+    h, w = image_shape[:2]
+    if part.area_px2 < MIN_PART_AREA_FRACTION_OF_IMAGE * h * w:
+        return False, "The detected part is too small relative to the image to measure reliably."
+
+    return True, ""
 
 
 def assess_detection(report: QualityReport, part: DetectedPart | None) -> QualityReport:

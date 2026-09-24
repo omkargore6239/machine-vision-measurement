@@ -11,9 +11,7 @@ def _build_part_and_circles():
     img, gt = make_axis_aligned_part(rect_xywh=(250, 200, 300, 200), holes=holes)
     part = segmentation.build_detected_part(img)
     gray = to_gray(img)
-    hough = geometry.detect_circles_hough(gray, part.mask)
-    contour_circles = geometry.detect_circles_contour(part.hole_contours)
-    circles = geometry.merge_circle_detections(hough, contour_circles)
+    circles, _ = geometry.detect_holes(gray, part.mask, part.hole_contours, part.bbox, part.area_px2)
     return part, circles
 
 

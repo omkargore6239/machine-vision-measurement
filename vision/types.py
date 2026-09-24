@@ -74,13 +74,51 @@ class DetectedPart:
 
 @dataclass
 class CircleFeature:
+    """A hole/circular feature that has already passed every acceptance gate
+    in `vision.geometry` — this is the reported, trustworthy result. See
+    `HoleCandidate` for the full diagnostic record (including rejected
+    candidates) used by Vision Debug Mode."""
+
     circle_id: int
     cx: float
     cy: float
-    r: float
-    method: str  # "hough" | "contour" | "hough+contour"
+    r: float  # equivalent radius, from measured area (2*sqrt(area/pi)/2)
+    method: str  # "contour" | "hough+contour"
     circularity: Optional[float]
     confidence: str
+    major_px: Optional[float] = None  # ellipse major axis (full length), if fit
+    minor_px: Optional[float] = None  # ellipse minor axis (full length), if fit
+    ellipse_angle_deg: Optional[float] = None
+    solidity: Optional[float] = None
+    confidence_score: Optional[float] = None  # 0-1 continuous score behind `confidence`
+    hough_confirmed: bool = False
+
+
+@dataclass
+class HoleCandidate:
+    """A candidate hole region with the full diagnostic evidence used to
+    accept or reject it. Every candidate is kept (not just accepted ones) so
+    Vision Debug Mode can show what was rejected and why."""
+
+    contour: np.ndarray
+    cx: float
+    cy: float
+    area_px2: float
+    equiv_diameter_px: float
+    circularity: float
+    solidity: float
+    aspect_ratio: float  # major/minor from an ellipse fit; 1.0 if no fit
+    major_axis_px: Optional[float]
+    minor_axis_px: Optional[float]
+    ellipse_angle_deg: Optional[float]
+    contrast: float
+    interior_std: float
+    edge_strength_px: float
+    hough_confirmed: bool = False
+    confidence_score: float = 0.0
+    confidence_label: str = CONFIDENCE_LOW
+    accepted: bool = False
+    rejection_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -5,7 +5,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from vision.types import CalibrationProfile, CircleFeature, DetectedPart
+from vision.types import CalibrationProfile, CircleFeature, DetectedPart, HoleCandidate
 
 COLOR_CONTOUR = (0, 255, 0)
 COLOR_BBOX = (255, 0, 0)
@@ -15,6 +15,8 @@ COLOR_CIRCLE_CENTER = (0, 0, 255)
 COLOR_TEXT = (0, 255, 255)
 COLOR_AXIS_X = (60, 60, 255)
 COLOR_AXIS_Y = (60, 220, 60)
+COLOR_ACCEPTED = (0, 220, 0)
+COLOR_REJECTED = (0, 0, 230)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
@@ -53,7 +55,11 @@ def draw_full_annotation(
     for c in circles:
         p = (int(round(c.cx)), int(round(c.cy)))
         r = int(round(c.r))
-        cv2.circle(out, p, r, COLOR_CIRCLE, 2)
+        if c.major_px is not None and c.minor_px is not None and c.ellipse_angle_deg is not None:
+            axes = (int(round(c.major_px / 2)), int(round(c.minor_px / 2)))
+            cv2.ellipse(out, p, axes, c.ellipse_angle_deg, 0, 360, COLOR_CIRCLE, 2)
+        else:
+            cv2.circle(out, p, r, COLOR_CIRCLE, 2)
         cv2.circle(out, p, 3, COLOR_CIRCLE_CENTER, -1)
         d_mm = None if profile is None else 2 * c.r * profile.mm_per_pixel
         text = f"H{c.circle_id} D={_fmt(2 * c.r, d_mm, 'mm')}"
@@ -72,4 +78,20 @@ def draw_full_annotation(
     banner_color = (0, 200, 0) if profile is not None else (0, 0, 220)
     cv2.putText(out, banner, (10, out.shape[0] - 12), FONT, 0.7, banner_color, 2, cv2.LINE_AA)
 
+    return out
+
+
+def draw_hole_candidates_debug(img: np.ndarray, candidates: list[HoleCandidate]) -> np.ndarray:
+    """Vision Debug Mode overlay: every hole candidate that was evaluated,
+    green if accepted and red if rejected, so a false-positive flood is
+    visible (and explainable) rather than silently hidden."""
+    out = img.copy()
+    for c in candidates:
+        color = COLOR_ACCEPTED if c.accepted else COLOR_REJECTED
+        cv2.drawContours(out, [c.contour], -1, color, 1)
+        p = (int(round(c.cx)), int(round(c.cy)))
+        cv2.circle(out, p, 2, color, -1)
+        if c.accepted:
+            cv2.putText(out, f"OK {c.confidence_score * 100:.0f}%", (p[0] + 4, p[1] - 4),
+                        FONT, 0.4, color, 1, cv2.LINE_AA)
     return out

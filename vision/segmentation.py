@@ -21,6 +21,15 @@ from vision import geometry
 MIN_OBJECT_AREA_FRACTION = 0.01
 MAX_OBJECT_AREA_FRACTION = 0.95
 
+# Hole-candidate area floor is a FRACTION of the part's own area, not a fixed
+# pixel count. A fixed absolute floor (e.g. 15px^2) is essentially noise-level
+# on a high-resolution real photo — every fleck of JPEG noise, fine texture,
+# or a text serif clears it, which is how a real product photo can produce
+# hundreds of false "holes". Scaling by part size keeps the floor meaningful
+# regardless of image resolution or how tightly the part fills the frame.
+MIN_HOLE_AREA_FRACTION_OF_PART = 0.0003
+MIN_HOLE_AREA_ABS_PX2 = 12.0
+
 
 def _score_contour(c: np.ndarray, image_area: float, W: int, H: int) -> float:
     area = cv2.contourArea(c)
@@ -171,9 +180,13 @@ def extract_outer_contour(mask: np.ndarray) -> np.ndarray | None:
 
 
 def extract_hole_contours(
-    gray: np.ndarray, outer_mask: np.ndarray, min_area_px2: float = 15.0, border_margin: int = 2,
+    gray: np.ndarray, outer_mask: np.ndarray, min_area_px2: float | None = None, border_margin: int = 2,
 ) -> list[np.ndarray]:
-    """Finds enclosed holes inside the part.
+    """Finds enclosed hole CANDIDATES inside the part — this is a coarse,
+    deliberately permissive first pass ("where might a hole be"), not a
+    decision about whether something IS a hole. That decision (circularity,
+    solidity, contrast, edge strength, Hough cross-check, confidence scoring)
+    is `geometry.evaluate_hole_candidates`'s job — see its docstring.
 
     `outer_mask` (from `make_foreground_mask`) is solid-filled — it has no
     interior holes of its own, by design, since it's used for outer-shape
@@ -183,9 +196,6 @@ def extract_hole_contours(
     and any small, fully-enclosed (non-border-touching) connected component
     in either group is a hole candidate. The two groups are complementary
     (one threshold value), so this never double-detects the same region.
-    Downstream circularity filtering (see `geometry.detect_circles_contour`)
-    is what actually decides whether a candidate is trustworthy — this
-    function only proposes candidates.
     """
     ys, xs = np.where(outer_mask == 255)
     if len(xs) == 0:
@@ -196,6 +206,9 @@ def extract_hole_contours(
 
     outer_x, outer_y, outer_w, outer_h = cv2.boundingRect(outer_mask)
     outer_area = cv2.countNonZero(outer_mask)
+
+    if min_area_px2 is None:
+        min_area_px2 = max(MIN_HOLE_AREA_ABS_PX2, MIN_HOLE_AREA_FRACTION_OF_PART * outer_area)
 
     high_mask = np.where((gray > thresh_val) & (outer_mask == 255), 255, 0).astype(np.uint8)
     low_mask = np.where((gray <= thresh_val) & (outer_mask == 255), 255, 0).astype(np.uint8)

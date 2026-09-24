@@ -12,12 +12,18 @@ toggle instead of being on screen by default.
 """
 from __future__ import annotations
 
+import logging
+import traceback
+
 import cv2
 import numpy as np
 import streamlit as st
 
 from vision import annotations, calibration, geometry, measurement, preprocessing, segmentation, validation
 from vision.types import CalibrationProfile, ToleranceSpec
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("machine_vision_measurement")
 
 st.set_page_config(page_title="Machine Vision Measurement", page_icon="📐", layout="wide")
 
@@ -77,6 +83,11 @@ with st.sidebar:
         "Show advanced options", value=False,
         help="Checkerboard/perspective calibration, the full measurement table, tolerances, "
              "and coordinate-origin choice.",
+    )
+    debug_mode = st.checkbox(
+        "🔍 Vision Debug Mode", value=False,
+        help="Show the preprocessed image, main-part mask, and every hole candidate "
+             "(accepted in green, rejected in red with the reason).",
     )
 
     st.divider()
@@ -339,49 +350,64 @@ elif step == 2:
 
             profile_for_image = active_profile
             display_img = img
-            if active_profile is not None and active_profile.method == "perspective":
-                st.caption("Perspective calibration active — measuring on the corrected (warped) image.")
-                try:
-                    display_img = calibration.warp_with_profile(img, active_profile)
-                except ValueError as e:
-                    st.error(f"Could not apply perspective calibration: {e}")
-                    display_img = img
-                    profile_for_image = None
 
-            part = segmentation.build_detected_part(display_img)
-            quality = validation.build_quality_report(display_img, part, profile_for_image)
+            try:
+                if active_profile is not None and active_profile.method == "perspective":
+                    st.caption("Perspective calibration active — measuring on the corrected (warped) image.")
+                    try:
+                        display_img = calibration.warp_with_profile(img, active_profile)
+                    except ValueError as e:
+                        st.error(f"Could not apply perspective calibration: {e}")
+                        display_img = img
+                        profile_for_image = None
 
-            blocking_issues = [i for i in quality.issues if i.severity in ("warning", "error")]
-            if blocking_issues:
-                with st.expander("⚠️ Image quality warnings", expanded=True):
+                part = segmentation.build_detected_part(display_img)
+                quality = validation.build_quality_report(display_img, part, profile_for_image)
+
+                # --- Hard gates: refuse to measure rather than mislead ------------
+                if quality.has_errors():
+                    st.error("Image quality insufficient for reliable measurement.")
                     for issue in quality.issues:
                         if issue.severity == "error":
-                            st.error(issue.message)
-                        elif issue.severity == "warning":
-                            st.warning(issue.message)
-                        elif advanced_mode:
-                            st.info(issue.message)
-            elif advanced_mode:
-                st.caption("✅ No image quality issues detected.")
+                            st.caption(f"• {issue.message}")
+                    continue
 
-            if part is None:
-                st.error("Could not confidently detect a part in this image. Try a clearer image with a plain, contrasting background.")
+                reliable, reliability_reason = validation.segmentation_is_reliable(part, display_img.shape[:2])
+                if not reliable:
+                    st.error("Part boundary could not be detected reliably.")
+                    st.caption(reliability_reason)
+                    continue
+
+                warnings_only = [i for i in quality.issues if i.severity == "warning"]
+                if warnings_only or advanced_mode:
+                    with st.expander("⚠️ Image quality warnings", expanded=bool(warnings_only)):
+                        if not warnings_only:
+                            st.success("No quality issues detected.")
+                        for issue in quality.issues:
+                            if issue.severity == "warning":
+                                st.warning(issue.message)
+                            elif issue.severity == "info" and advanced_mode:
+                                st.info(issue.message)
+
+                gray = preprocessing.to_gray(display_img)
+                circles, candidates = geometry.detect_holes(gray, part.mask, part.hole_contours, part.bbox, part.area_px2)
+
+                x, y, w, h = part.bbox
+                if origin_choice == "Part centroid":
+                    m = cv2.moments(part.contour)
+                    origin_px = (m["m10"] / m["m00"], m["m01"] / m["m00"]) if m["m00"] else (x + w / 2, y + h / 2)
+                else:
+                    origin_px = (float(x), float(y))
+
+                records = measurement.build_measurement_records(part, circles, profile_for_image, origin_px)
+                annotated = annotations.draw_full_annotation(display_img, part, circles, profile_for_image, origin_px)
+            except Exception:
+                logger.exception("Unexpected error while processing %s", uf.name)
+                st.error("An internal error occurred while processing this image. This has been logged; "
+                         "try a different image or report the issue.")
+                with st.expander("Technical details"):
+                    st.code(traceback.format_exc())
                 continue
-
-            gray = preprocessing.to_gray(display_img)
-            hough = geometry.detect_circles_hough(gray, part.mask)
-            contour_circles = geometry.detect_circles_contour(part.hole_contours)
-            circles = geometry.merge_circle_detections(hough, contour_circles)
-
-            x, y, w, h = part.bbox
-            if origin_choice == "Part centroid":
-                m = cv2.moments(part.contour)
-                origin_px = (m["m10"] / m["m00"], m["m01"] / m["m00"]) if m["m00"] else (x + w / 2, y + h / 2)
-            else:
-                origin_px = (float(x), float(y))
-
-            records = measurement.build_measurement_records(part, circles, profile_for_image, origin_px)
-            annotated = annotations.draw_full_annotation(display_img, part, circles, profile_for_image, origin_px)
 
             col_img, col_summary = st.columns([3, 2])
             with col_img:
@@ -397,15 +423,47 @@ elif step == 2:
                 m2.metric("Height", fmt_value(height_r.px_value, height_r.mm_value))
 
                 if circles:
-                    st.write(f"**{len(circles)} hole(s) detected:**")
+                    st.write(f"**{len(circles)} reliable hole(s) detected:**")
                     for c in circles:
-                        d_record = next(r for r in records if r.feature == f"Hole {c.circle_id} Diameter")
+                        d_record = next(r for r in records if r.feature == f"Hole {c.circle_id} Equivalent Diameter")
                         st.write(f"- Hole {c.circle_id}: Ø {fmt_value(d_record.px_value, d_record.mm_value)} ({c.confidence} confidence)")
                 else:
-                    st.caption("No holes detected.")
+                    st.caption("0 reliable holes detected.")
 
                 if profile_for_image is None:
                     st.caption("⚠️ Showing pixels only — calibrate in Step 1 to see mm.")
+
+            if debug_mode:
+                with st.expander(f"🔍 Vision Debug — {uf.name}", expanded=True):
+                    d1, d2 = st.columns(2)
+                    with d1:
+                        st.image(preprocessing.to_rgb(display_img), caption="Preprocessed / working image", use_container_width=True)
+                    with d2:
+                        st.image(part.mask, caption=f"Main-part mask (via {part.segmentation_method})", use_container_width=True)
+
+                    debug_img = annotations.draw_hole_candidates_debug(display_img, candidates)
+                    st.image(preprocessing.to_rgb(debug_img), caption="Hole candidates — green = accepted, red = rejected", use_container_width=True)
+
+                    accepted = [c for c in candidates if c.accepted]
+                    rejected = [c for c in candidates if not c.accepted]
+                    st.write(f"**{len(accepted)} accepted, {len(rejected)} rejected** out of {len(candidates)} candidate region(s).")
+
+                    for i, c in enumerate(accepted, start=1):
+                        st.caption(
+                            f"Hole #{i}: confidence {c.confidence_score * 100:.0f}% ({c.confidence_label}) · "
+                            f"center ({c.cx:.1f}, {c.cy:.1f}) · equivalent diameter {c.equiv_diameter_px:.1f}px"
+                            + (" · Hough-confirmed" if c.hough_confirmed else "")
+                        )
+
+                    if rejected:
+                        st.write("Rejected candidates:")
+                        for c in rejected[:50]:
+                            st.caption(
+                                f"- center ({c.cx:.1f}, {c.cy:.1f}), diameter {c.equiv_diameter_px:.1f}px — "
+                                + "; ".join(c.rejection_reasons)
+                            )
+                        if len(rejected) > 50:
+                            st.caption(f"...and {len(rejected) - 50} more rejected candidates.")
 
             if advanced_mode:
                 with st.expander("Full measurement table & tolerances"):
