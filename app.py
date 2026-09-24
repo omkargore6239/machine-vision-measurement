@@ -12,13 +12,18 @@ toggle instead of being on screen by default.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import traceback
+from datetime import datetime
+from html import escape as esc_html
 
 import cv2
 import numpy as np
 import streamlit as st
 
+from ui import inspection_view, theme
+from utils import export as export_utils
 from vision import annotations, calibration, geometry, measurement, preprocessing, segmentation, validation
 from vision.types import CalibrationProfile, ToleranceSpec
 
@@ -26,6 +31,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("machine_vision_measurement")
 
 st.set_page_config(page_title="Machine Vision Measurement", page_icon="📐", layout="wide")
+theme.inject_theme_css()
 
 IMAGE_TYPES = ["jpg", "jpeg", "png", "bmp", "webp"]
 
@@ -38,6 +44,7 @@ st.session_state.setdefault("pending_profile", None)
 st.session_state.setdefault("pending_warp_preview", None)
 st.session_state.setdefault("batch_results", {})
 st.session_state.setdefault("tolerance_specs", {})
+st.session_state.setdefault("selected_feature", {})
 
 
 def get_active_profile() -> CalibrationProfile | None:
@@ -64,37 +71,76 @@ def fmt_value(px_value: float | None, mm_value: float | None) -> str:
     return "—"
 
 
+def compute_aggregate_status(tolerance_results: list) -> tuple[str, str]:
+    """The single tri-state (+neutral) aggregate used everywhere a PASS/FAIL
+    summary is shown (hero banner, feature cards, history, system status):
+    FAIL if anything failed; INCOMPLETE if nothing failed but a configured
+    spec couldn't be measured (N/A); PASS if at least one real PASS and
+    nothing worse; else a neutral "measured, no tolerances configured" state
+    — never a fabricated PASS/FAIL when no spec was ever set."""
+    if not tolerance_results:
+        return "neutral", "MEASURED"
+    if any(t.status == "FAIL" for t in tolerance_results):
+        return "fail", "FAIL"
+    if any(t.status == "N/A" for t in tolerance_results):
+        return "incomplete", "INCOMPLETE"
+    if any(t.status == "PASS" for t in tolerance_results):
+        return "pass", "PASS"
+    return "neutral", "MEASURED"
+
+
 # ---------------------------------------------------------------------------
-# Sidebar: calibration status + advanced-mode toggle
+# Sidebar: grouped navigation (Inspection / Setup / Diagnostics / Reports)
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.header("Calibration status")
-    active_profile = get_active_profile()
-
-    if active_profile is not None:
-        st.success(f"CALIBRATED — {active_profile.name}")
-        st.caption(f"{active_profile.mm_per_pixel:.5f} mm/pixel · confidence {active_profile.confidence}")
-    else:
-        st.error("NOT CALIBRATED")
-        st.caption("Only pixel measurements will be produced until a calibration profile is active.")
-
-    st.divider()
-    advanced_mode = st.checkbox(
-        "Show advanced options", value=False,
-        help="Checkerboard/perspective calibration, the full measurement table, tolerances, "
-             "and coordinate-origin choice.",
-    )
-    debug_mode = st.checkbox(
-        "🔍 Vision Debug Mode", value=False,
-        help="Show the preprocessed image, main-part mask, and every hole candidate "
-             "(accepted in green, rejected in red with the reason).",
-    )
-
-    st.divider()
-    if st.button("🔄 Start over", use_container_width=True):
+    st.markdown('<div class="mv-nav-heading">Inspection</div>', unsafe_allow_html=True)
+    if st.button("New Inspection", use_container_width=True, key="nav_new_inspection"):
         st.session_state["batch_results"] = {}
         st.session_state["tolerance_specs"] = {}
+        st.session_state["selected_feature"] = {}
         go_to_step(1)
+    if st.button("Measure Part", use_container_width=True, key="nav_measure_part"):
+        go_to_step(2)
+    with st.expander("Inspection History", expanded=False):
+        if st.session_state["batch_results"]:
+            for fname, data in st.session_state["batch_results"].items():
+                status_key, status_label = compute_aggregate_status(data.get("tolerance_results", []))
+                dot = {"pass": "🟢", "fail": "🔴", "incomplete": "🟠"}.get(status_key, "⚪")
+                st.caption(f"{dot} **{fname}** — {status_label} · {data.get('timestamp', '—')}")
+        else:
+            st.caption("No inspections yet this session.")
+
+    st.markdown('<div class="mv-nav-heading">Setup</div>', unsafe_allow_html=True)
+    if st.button("Calibration", use_container_width=True, key="nav_calibration"):
+        go_to_step(1)
+    advanced_mode = st.checkbox(
+        "Inspection Settings", value=False, key="advanced_mode",
+        help="Full measurement table, tolerance configuration, and coordinate-origin choice.",
+    )
+    st.markdown(
+        '<div class="mv-nav-item-disabled">Feature Configuration '
+        '<span style="float:right;">Coming soon</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="mv-nav-heading">Diagnostics</div>', unsafe_allow_html=True)
+    debug_mode = st.checkbox(
+        "Vision Debug", value=False, key="debug_mode",
+        help="Preprocessed image, main-part mask, and every hole candidate "
+             "(accepted/rejected, with the reason).",
+    )
+    with st.expander("System Status", expanded=False):
+        _sys_profile = get_active_profile()
+        st.caption(f"Calibration: {'ACTIVE — ' + _sys_profile.name if _sys_profile else 'NOT ACTIVE'}")
+        st.caption(f"Images measured this session: {len(st.session_state['batch_results'])}")
+        _statuses = [compute_aggregate_status(d.get("tolerance_results", []))[0]
+                     for d in st.session_state["batch_results"].values()]
+        st.caption(f"Pass: {_statuses.count('pass')}  ·  Fail: {_statuses.count('fail')}  ·  "
+                   f"Incomplete: {_statuses.count('incomplete')}")
+
+    st.markdown('<div class="mv-nav-heading">Reports</div>', unsafe_allow_html=True)
+    if st.button("Inspection Reports / Export", use_container_width=True, key="nav_export"):
+        go_to_step(3)
 
     st.divider()
     st.caption(
@@ -104,8 +150,57 @@ with st.sidebar:
 
 active_profile = get_active_profile()
 
-st.title("📐 Machine Vision Measurement")
-st.caption("Calibrated part measurement — pixel and millimetre values are always shown separately.")
+_title_col, _status_col = st.columns([3, 2])
+with _title_col:
+    st.title("Machine Vision Inspection")
+    st.caption("Dimensional Quality Inspection System")
+with _status_col:
+    _cal_line = (f'<span class="mv-status-dot pass"></span>Calibration: <b>ACTIVE</b> — {esc_html(active_profile.name)}'
+                 if active_profile else '<span class="mv-status-dot warn"></span>Calibration: <b>NOT ACTIVE</b>')
+    st.markdown(
+        f"""<div style="text-align:right; padding-top:10px;">
+            <div><span class="mv-status-dot pass"></span><b>SYSTEM READY</b></div>
+            <div class="mv-header-sub">{_cal_line}</div>
+            <div class="mv-header-sub">{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+# ---------------------------------------------------------------------------
+# Toolbar — every button routes to a real action (no decorative controls)
+# ---------------------------------------------------------------------------
+with st.container(key="mv_toolbar"):
+    tb = st.columns(7)
+    with tb[0]:
+        if st.button("New Inspection", key="tb_new", use_container_width=True):
+            st.session_state["batch_results"] = {}
+            st.session_state["tolerance_specs"] = {}
+            st.session_state["selected_feature"] = {}
+            go_to_step(1)
+    with tb[1]:
+        if st.button("Load Image", key="tb_load", use_container_width=True):
+            go_to_step(2)
+    with tb[2]:
+        if st.button("Re-measure", key="tb_remeasure", use_container_width=True):
+            st.rerun()
+    with tb[3]:
+        if st.button("Calibration", key="tb_cal", use_container_width=True):
+            go_to_step(1)
+    with tb[4]:
+        if st.button("Debug", key="tb_debug", use_container_width=True):
+            st.session_state["debug_mode"] = not st.session_state.get("debug_mode", False)
+            st.rerun()
+    with tb[5]:
+        if st.button("Export Report", key="tb_export", use_container_width=True):
+            go_to_step(3)
+    with tb[6]:
+        st.markdown(
+            '<button onclick="window.print()" style="width:100%;padding:3px 10px;'
+            'font-size:0.8rem;border:1px solid #D9DEE7;border-radius:5px;background:#FFFFFF;'
+            'color:#17202A;cursor:pointer;font-family:Inter,sans-serif;margin-top:1px;">'
+            '\U0001F5A8 Print</button>',
+            unsafe_allow_html=True,
+        )
 
 # ---------------------------------------------------------------------------
 # Step navigation bar
@@ -330,15 +425,16 @@ elif step == 2:
     if advanced_mode:
         origin_choice = st.radio("MM coordinate origin", ["Bounding box top-left", "Part centroid"], horizontal=True)
         st.checkbox("Y axis increases upward (engineering convention)", value=True)
+        decimals = st.selectbox("Decimal places for mm values", [0, 1, 2, 3, 4], index=2, key="decimals_precision")
     else:
         origin_choice = "Bounding box top-left"
+        decimals = 2
 
     if not uploaded_files:
         st.info("Upload at least one image to begin measurement.")
     else:
-        for uf in uploaded_files:
+        for idx, uf in enumerate(uploaded_files):
             st.divider()
-            st.markdown(f"### {uf.name}")
 
             try:
                 original = preprocessing.decode_image_bytes(uf.getvalue())
@@ -350,123 +446,367 @@ elif step == 2:
 
             profile_for_image = active_profile
             display_img = img
+            part = quality = seg_diag = gray = circles = candidates = None
+            records = feature_table_rows = tolerance_results = origin_px = None
+            pipeline_ok = False
 
-            try:
-                if active_profile is not None and active_profile.method == "perspective":
-                    st.caption("Perspective calibration active — measuring on the corrected (warped) image.")
-                    try:
-                        display_img = calibration.warp_with_profile(img, active_profile)
-                    except ValueError as e:
-                        st.error(f"Could not apply perspective calibration: {e}")
-                        display_img = img
-                        profile_for_image = None
+            # -----------------------------------------------------------------
+            # Run the unchanged detection/measurement pipeline, staged so the
+            # status label reflects real work already being done (no artificial
+            # delay is added anywhere below).
+            # -----------------------------------------------------------------
+            with st.status(f"Inspecting {uf.name}", expanded=False) as status:
+                try:
+                    if active_profile is not None and active_profile.method == "perspective":
+                        status.update(label="Applying perspective correction...")
+                        try:
+                            display_img = calibration.warp_with_profile(img, active_profile)
+                        except ValueError as e:
+                            st.error(f"Could not apply perspective calibration: {e}")
+                            display_img = img
+                            profile_for_image = None
 
-                part = segmentation.build_detected_part(display_img)
-                quality = validation.build_quality_report(display_img, part, profile_for_image)
+                    status.update(label="Detecting part boundary...")
+                    part = segmentation.build_detected_part(display_img)
+                    quality = validation.build_quality_report(display_img, part, profile_for_image)
 
-                # --- Hard gates: refuse to measure rather than mislead ------------
-                if quality.has_errors():
-                    st.error("Image quality insufficient for reliable measurement.")
-                    for issue in quality.issues:
-                        if issue.severity == "error":
-                            st.caption(f"• {issue.message}")
-                    continue
-
-                reliable, reliability_reason = validation.segmentation_is_reliable(part, display_img.shape[:2])
-                if not reliable:
-                    st.error("Part boundary could not be detected reliably.")
-                    st.caption(reliability_reason)
-                    continue
-
-                warnings_only = [i for i in quality.issues if i.severity == "warning"]
-                if warnings_only or advanced_mode:
-                    with st.expander("⚠️ Image quality warnings", expanded=bool(warnings_only)):
-                        if not warnings_only:
-                            st.success("No quality issues detected.")
+                    # --- Hard gate: refuse to measure rather than mislead ------
+                    if quality.has_errors():
+                        status.update(label="Image quality insufficient", state="error")
+                        st.error("Image quality insufficient for reliable measurement.")
                         for issue in quality.issues:
-                            if issue.severity == "warning":
-                                st.warning(issue.message)
-                            elif issue.severity == "info" and advanced_mode:
-                                st.info(issue.message)
+                            if issue.severity == "error":
+                                st.caption(f"• {issue.message}")
+                    else:
+                        status.update(label="Validating outer boundary...")
+                        seg_diag = validation.evaluate_segmentation(part, display_img.shape[:2])
 
-                gray = preprocessing.to_gray(display_img)
-                circles, candidates = geometry.detect_holes(gray, part.mask, part.hole_contours, part.bbox, part.area_px2)
+                        if debug_mode:
+                            with st.expander(f"🔍 Vision Debug — outer boundary ({uf.name})", expanded=True):
+                                if part is not None:
+                                    boundary_img = annotations.draw_boundary_debug(display_img, part)
+                                    st.image(preprocessing.to_rgb(boundary_img), caption="Outer boundary diagnostics", use_container_width=True)
+                                m1, m2, m3, m4 = st.columns(4)
+                                m1.metric("Contour area", f"{seg_diag.area_px2:,.0f} px²")
+                                m2.metric("Bounding-box area", f"{seg_diag.bbox_area_px2:,.0f} px²")
+                                m3.metric("Extent (informational)", f"{seg_diag.extent:.0%}")
+                                m4.metric("Perimeter", f"{seg_diag.perimeter_px:,.0f} px")
+                                m5, m6, m7 = st.columns(3)
+                                m5.metric("Convex hull area", f"{seg_diag.convex_hull_area_px2:,.0f} px²")
+                                m6.metric("Solidity", f"{seg_diag.solidity:.0%}",
+                                          help=f"Must be ≥ {validation.MIN_SOLIDITY_FOR_RELIABLE_CONTOUR:.0%} to accept.")
+                                m7.metric("Compactness", f"{seg_diag.compactness:.2f}",
+                                          help=f"Must be ≤ {validation.MAX_COMPACTNESS_FOR_RELIABLE_CONTOUR:.1f} to accept "
+                                               "(1.0 = a perfect circle; higher = more jagged/noisy).")
+                                if seg_diag.accepted:
+                                    st.success("Boundary ACCEPTED — extent is low fill of the bounding rectangle "
+                                               "shown above for information only; it is never used to reject a shape.")
+                                else:
+                                    st.error("Boundary REJECTED")
+                                    for r in seg_diag.reasons:
+                                        st.caption(f"• {r}")
 
-                x, y, w, h = part.bbox
-                if origin_choice == "Part centroid":
-                    m = cv2.moments(part.contour)
-                    origin_px = (m["m10"] / m["m00"], m["m01"] / m["m00"]) if m["m00"] else (x + w / 2, y + h / 2)
-                else:
-                    origin_px = (float(x), float(y))
+                        # --- Hard gate: refuse to measure rather than mislead --
+                        if not seg_diag.accepted:
+                            status.update(label="Boundary rejected", state="error")
+                            st.error("Part boundary could not be detected reliably.")
+                            st.caption(" ".join(seg_diag.reasons))
+                        else:
+                            warnings_only = [i for i in quality.issues if i.severity == "warning"]
+                            if warnings_only or advanced_mode:
+                                with st.expander("⚠️ Image quality warnings", expanded=bool(warnings_only)):
+                                    if not warnings_only:
+                                        st.success("No quality issues detected.")
+                                    for issue in quality.issues:
+                                        if issue.severity == "warning":
+                                            st.warning(issue.message)
+                                        elif issue.severity == "info" and advanced_mode:
+                                            st.info(issue.message)
 
-                records = measurement.build_measurement_records(part, circles, profile_for_image, origin_px)
-                annotated = annotations.draw_full_annotation(display_img, part, circles, profile_for_image, origin_px)
-            except Exception:
-                logger.exception("Unexpected error while processing %s", uf.name)
-                st.error("An internal error occurred while processing this image. This has been logged; "
-                         "try a different image or report the issue.")
-                with st.expander("Technical details"):
-                    st.code(traceback.format_exc())
+                            status.update(label="Detecting features (holes / bores)...")
+                            gray = preprocessing.to_gray(display_img)
+                            circles, candidates = geometry.detect_holes(
+                                gray, part.mask, part.hole_contours, part.bbox, part.area_px2, part.contour,
+                            )
+                            circles = measurement.classify_and_label_circles(circles, part)
+
+                            status.update(label="Measuring dimensions...")
+                            x, y, w, h = part.bbox
+                            if origin_choice == "Part centroid":
+                                m = cv2.moments(part.contour)
+                                origin_px = (m["m10"] / m["m00"], m["m01"] / m["m00"]) if m["m00"] else (x + w / 2, y + h / 2)
+                            else:
+                                origin_px = (float(x), float(y))
+
+                            records = measurement.build_measurement_records(part, circles, profile_for_image, origin_px)
+
+                            status.update(label="Checking tolerances...")
+                            tolerance_results = measurement.apply_tolerances(
+                                records, st.session_state["tolerance_specs"].get(uf.name, {}),
+                            )
+                            feature_table_rows = measurement.build_feature_summary_table(
+                                circles, profile_for_image, origin_px, tolerance_results,
+                            )
+
+                            pipeline_ok = True
+                            status.update(label="Inspection complete", state="complete")
+                except Exception:
+                    logger.exception("Unexpected error while processing %s", uf.name)
+                    status.update(label="Internal error", state="error")
+                    st.error("An internal error occurred while processing this image. This has been logged; "
+                             "try a different image or report the issue.")
+                    with st.expander("Technical details"):
+                        st.code(traceback.format_exc())
+
+            if not pipeline_ok:
                 continue
 
-            col_img, col_summary = st.columns([3, 2])
-            with col_img:
-                st.image(preprocessing.to_rgb(annotated), caption="Annotated measurement", use_container_width=True)
-                if advanced_mode:
+            # ===================================================================
+            # Result screen — light industrial metrology dashboard layout
+            # ===================================================================
+            tol_by_feature = {t.feature: t for t in tolerance_results}
+            agg_key, agg_label = compute_aggregate_status(tolerance_results)
+
+            inspection_id = hashlib.md5(uf.getvalue()).hexdigest()[:8].upper()
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            n_bores = sum(1 for c in circles if c.feature_type == "bore")
+            n_holes = len(circles) - n_bores
+            n_pass = sum(1 for t in tolerance_results if t.status == "PASS")
+
+            # --- PART INSPECTION RESULT: big PASS/FAIL/INCOMPLETE hero -----------
+            hero_sub = (
+                f"Inspection Complete &nbsp;·&nbsp; Part <b>{esc_html(uf.name)}</b> "
+                f"&nbsp;·&nbsp; ID {inspection_id} &nbsp;·&nbsp; {timestamp}<br/>"
+                f"Calibration: <b>{esc_html(profile_for_image.name) if profile_for_image else 'Not calibrated'}</b>"
+                + (f" &nbsp;·&nbsp; {len(tolerance_results)} characteristic(s) inspected, "
+                   f"{n_pass}/{len(tolerance_results)} passed" if tolerance_results else
+                   " &nbsp;·&nbsp; 0 characteristics configured — showing measured values only")
+            )
+            st.markdown(
+                f"""<div class="mv-hero mv-hero-{agg_key}">
+                    <div class="mv-hero-title">{agg_label}</div>
+                    <div class="mv-hero-sub">{hero_sub}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"""<div class="mv-panel" style="padding:10px 16px;">
+                    <div class="mv-chip-row" style="margin-top:0;">
+                        <span class="mv-chip">{len(circles)} feature(s)</span>
+                        <span class="mv-chip">{n_holes} hole(s)</span>
+                        <span class="mv-chip">{n_bores} bore(s)</span>
+                        <span class="mv-chip">Boundary: {esc_html(part.segmentation_method)}</span>
+                    </div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+            sel_map = st.session_state["selected_feature"]
+            selected_short_id = sel_map.get(uf.name)
+
+            # --- Main workspace: ~65% image viewer / ~35% measurement panel ------
+            col_view, col_side = st.columns([13, 7])
+
+            with col_view:
+                tab_labels = ["Original", "Processed", "Measurement", "Overlay"] + (["Debug"] if debug_mode else [])
+                tabs = st.tabs(tab_labels)
+
+                # Built once, used by both the Measurement tab (render) and
+                # the Debug tab (placement diagnostics) in this same run.
+                img_h, img_w = display_img.shape[:2]
+                svg, placement_diag = inspection_view.build_svg_overlay(
+                    part, circles, records, profile_for_image, origin_px, img_w, img_h,
+                    tol_by_feature, selected_short_id, decimals=decimals,
+                )
+                focus = None
+                if selected_short_id:
+                    focus_circle = next((c for c in circles if c.short_id == selected_short_id), None)
+                    if focus_circle is not None:
+                        focus = (focus_circle.cx, focus_circle.cy, focus_circle.r)
+
+                with tabs[0]:
+                    st.image(preprocessing.to_rgb(original), caption="Original (as uploaded)", use_container_width=True)
+
+                with tabs[1]:
+                    st.image(preprocessing.to_rgb(display_img), caption="Preprocessed / working image", use_container_width=True)
                     st.caption(f"Segmentation method: {part.segmentation_method}")
-            with col_summary:
-                st.markdown("#### Results")
+
+                with tabs[2]:
+                    html_component = inspection_view.build_inspection_html(
+                        display_img, svg, img_w, img_h, viewport_id=f"mvViewport{idx}", focus=focus,
+                    )
+                    st.components.v1.html(html_component, height=inspection_view.COMPONENT_HEIGHT_PX, scrolling=False)
+                    if profile_for_image is None:
+                        st.caption("⚠️ Showing pixels only — calibrate in Step 1 to see mm.")
+                    perspective_notes = [i.message for i in quality.issues if "perspective" in i.message.lower() or "aspect ratio" in i.message.lower()]
+                    for note in perspective_notes:
+                        st.caption(f"ℹ️ {note}")
+
+                with tabs[3]:
+                    overlay_img = annotations.draw_full_annotation(display_img, part, circles, profile_for_image, origin_px)
+                    st.image(preprocessing.to_rgb(overlay_img), caption="Detection overlay (boundary + circles)", use_container_width=True)
+
+                if debug_mode:
+                    with tabs[4]:
+                        st.markdown("##### 1–2 · Original / preprocessed")
+                        d1, d2 = st.columns(2)
+                        with d1:
+                            st.image(preprocessing.to_rgb(original), caption="Original (as uploaded)", use_container_width=True)
+                        with d2:
+                            st.image(preprocessing.to_rgb(display_img), caption="Preprocessed / working image", use_container_width=True)
+
+                        st.markdown("##### 3–6 · Intermediate hole-candidate masks")
+                        hole_masks = segmentation.debug_hole_masks(gray, part.mask)
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        with mc1:
+                            st.image(hole_masks.get("otsu_dark"), caption="Otsu threshold (dark class)", use_container_width=True)
+                        with mc2:
+                            st.image(hole_masks.get("adaptive_raw"), caption="Adaptive threshold (raw)", use_container_width=True)
+                        with mc3:
+                            st.image(hole_masks.get("adaptive_after_morphology"), caption="Adaptive threshold (after morphological open+close)", use_container_width=True)
+                        with mc4:
+                            st.image(hole_masks.get("canny"), caption="Canny edges (within part mask)", use_container_width=True)
+                        st.image(part.mask, caption=f"Main-part mask (via {part.segmentation_method})", width=300)
+
+                        st.markdown("##### 7–9 · Hole candidates")
+                        debug_img = annotations.draw_hole_candidates_debug(display_img, candidates)
+                        st.image(preprocessing.to_rgb(debug_img), caption="Hole candidates — green = accepted, red = rejected", use_container_width=True)
+
+                        accepted = [c for c in candidates if c.accepted]
+                        rejected = [c for c in candidates if not c.accepted]
+                        st.write(f"**{len(accepted)} accepted, {len(rejected)} rejected** out of {len(candidates)} candidate region(s).")
+
+                        for i, c in enumerate(accepted, start=1):
+                            st.caption(
+                                f"Hole #{i}: confidence {c.confidence_score * 100:.0f}% ({c.confidence_label}) · "
+                                f"center ({c.cx:.1f}, {c.cy:.1f}) · equivalent diameter {c.equiv_diameter_px:.1f}px"
+                                + (" · Hough-confirmed" if c.hough_confirmed else "")
+                            )
+
+                        if rejected:
+                            st.write("Rejected candidates:")
+                            for c in rejected[:50]:
+                                st.caption(
+                                    f"- center ({c.cx:.1f}, {c.cy:.1f}), diameter {c.equiv_diameter_px:.1f}px — "
+                                    + "; ".join(c.rejection_reasons)
+                                )
+                            if len(rejected) > 50:
+                                st.caption(f"...and {len(rejected) - 50} more rejected candidates.")
+
+                        st.markdown("##### 10 · Label-placement diagnostics")
+                        st.caption(
+                            "Every dimension/feature/corner label's chosen position out of the 8 "
+                            "candidates (N/S/E/W/NE/NW/SE/SW), its collision score (lower is better; "
+                            "0 = no overlap with anything already placed), and its final bounding box "
+                            "in image pixels."
+                        )
+                        placement_rows = [{
+                            "Label": d["id"], "Kind": d["kind"], "Direction": d["direction"],
+                            "Collision score": d["score"],
+                            "Box center (px)": f"({d['box']['cx']:.1f}, {d['box']['cy']:.1f})",
+                            "Box size (px)": f"{d['box']['w']:.0f} × {d['box']['h']:.0f}",
+                        } for d in placement_diag]
+                        st.dataframe(placement_rows, use_container_width=True, hide_index=True)
+
+                        st.markdown("##### 11 · Dimension / feature anchor points")
+                        anchor_rows = [{"Feature": c.short_id or c.label, "Anchor X (px)": round(c.cx, 1),
+                                         "Anchor Y (px)": round(c.cy, 1), "Radius (px)": round(c.r, 1)} for c in circles]
+                        st.dataframe(anchor_rows, use_container_width=True, hide_index=True)
+
+                        st.markdown("##### 12 · Calibration scale")
+                        if profile_for_image is not None:
+                            st.caption(f"{profile_for_image.mm_per_pixel:.6f} mm/pixel — method: {profile_for_image.method}")
+                        else:
+                            st.caption("No calibration active — all values above are in pixels only.")
+
+            details_key = f"view_details_{uf.name}"
+
+            with col_side:
                 width_r = next(r for r in records if r.feature == "Bounding Box Width")
                 height_r = next(r for r in records if r.feature == "Bounding Box Height")
                 m1, m2 = st.columns(2)
                 m1.metric("Width", fmt_value(width_r.px_value, width_r.mm_value))
                 m2.metric("Height", fmt_value(height_r.px_value, height_r.mm_value))
 
+                with st.container(border=True):
+                    st.markdown("**Calibration**")
+                    if profile_for_image is not None:
+                        st.markdown(
+                            f'<span class="mv-status-dot pass"></span>**ACTIVE** — {esc_html(profile_for_image.name)}',
+                            unsafe_allow_html=True,
+                        )
+                        ref_bits = f"Scale: {profile_for_image.mm_per_pixel:.5f} mm/px"
+                        if profile_for_image.known_mm:
+                            ref_bits += f"  ·  Reference: {profile_for_image.known_mm:.2f} mm"
+                        st.caption(ref_bits)
+                        with st.expander("Calibration Details"):
+                            st.caption(f"Method: {profile_for_image.method}")
+                            st.caption(f"Confidence: {profile_for_image.confidence}")
+                            st.caption(f"Created: {profile_for_image.created_at}")
+                            for n in profile_for_image.notes:
+                                st.caption(f"• {n}")
+                    else:
+                        st.markdown('<span class="mv-status-dot warn"></span>**NOT CALIBRATED**', unsafe_allow_html=True)
+                        st.caption("Pixel values only — calibrate in Step 1 for mm.")
+                    for _note in quality.issues:
+                        if "perspective" in _note.message.lower() or "aspect ratio" in _note.message.lower():
+                            st.caption(f"⚠️ {_note.message}")
+
+                st.markdown("**Detected Features**")
                 if circles:
-                    st.write(f"**{len(circles)} reliable hole(s) detected:**")
-                    for c in circles:
-                        d_record = next(r for r in records if r.feature == f"Hole {c.circle_id} Equivalent Diameter")
-                        st.write(f"- Hole {c.circle_id}: Ø {fmt_value(d_record.px_value, d_record.mm_value)} ({c.confidence} confidence)")
+                    # Every feature is shown individually and always-visible
+                    # (never just an aggregate count) — clicking its small
+                    # select button also highlights it on the image tab.
+                    for c, row in zip(circles, feature_table_rows):
+                        tol = tol_by_feature.get(f"{c.label} Equivalent Diameter")
+                        status_key = inspection_view.feature_result_status_key(tol)
+                        result_label = inspection_view.feature_result_label(tol)
+                        is_selected = c.short_id == selected_short_id
+                        card_classes = "mv-feature-card" + (f" {status_key}" if status_key in ("pass", "fail", "warn") else "") + (" selected" if is_selected else "")
+                        edge_r = next((r for r in records if r.feature == f"{c.label} to Nearest Edge"), None)
+                        edge_str = fmt_value(edge_r.px_value, edge_r.mm_value) if edge_r else "—"
+                        st.markdown(
+                            f"""<div class="{card_classes}">
+                                <div class="mv-feature-card-head">
+                                    <span>{esc_html(row['Feature'])} — {esc_html(row['Type'])}</span>
+                                    <span class="mv-badge mv-badge-{status_key}" style="padding:2px 8px;font-size:0.7rem;">{esc_html(result_label)}</span>
+                                </div>
+                                <div class="mv-feature-card-grid">
+                                    <div>Ø <b>{row['Diameter']} {row['Unit']}</b></div>
+                                    <div>X <b>{row['X']} {row['Unit']}</b></div>
+                                    <div>Y <b>{row['Y']} {row['Unit']}</b></div>
+                                    <div>Confidence <b>{esc_html(c.confidence)}</b></div>
+                                    <div>Tolerance <b>{esc_html(row['Tolerance'])}</b></div>
+                                    <div>Edge dist <b>{esc_html(edge_str)}</b></div>
+                                </div>
+                            </div>""",
+                            unsafe_allow_html=True,
+                        )
+                        if st.button(
+                            f"{'Hide highlight' if is_selected else 'Highlight on image'}",
+                            key=f"sel_{uf.name}_{c.short_id}_{idx}", use_container_width=True,
+                        ):
+                            sel_map[uf.name] = None if is_selected else c.short_id
+                            st.rerun()
                 else:
                     st.caption("0 reliable holes detected.")
 
-                if profile_for_image is None:
-                    st.caption("⚠️ Showing pixels only — calibrate in Step 1 to see mm.")
+                st.write("")
+                exp_col1, exp_col2 = st.columns(2)
+                with exp_col1:
+                    if st.button("View Details", key=f"details_btn_{uf.name}_{idx}", use_container_width=True):
+                        st.session_state[details_key] = not st.session_state.get(details_key, False)
+                with exp_col2:
+                    report_text = export_utils.build_report_text(
+                        uf.name, records, profile_for_image, quality, tolerance_results,
+                    )
+                    st.download_button(
+                        "Export Report", data=report_text, file_name=f"{uf.name}_report.txt",
+                        mime="text/plain", key=f"export_btn_{uf.name}_{idx}", use_container_width=True,
+                    )
 
-            if debug_mode:
-                with st.expander(f"🔍 Vision Debug — {uf.name}", expanded=True):
-                    d1, d2 = st.columns(2)
-                    with d1:
-                        st.image(preprocessing.to_rgb(display_img), caption="Preprocessed / working image", use_container_width=True)
-                    with d2:
-                        st.image(part.mask, caption=f"Main-part mask (via {part.segmentation_method})", use_container_width=True)
-
-                    debug_img = annotations.draw_hole_candidates_debug(display_img, candidates)
-                    st.image(preprocessing.to_rgb(debug_img), caption="Hole candidates — green = accepted, red = rejected", use_container_width=True)
-
-                    accepted = [c for c in candidates if c.accepted]
-                    rejected = [c for c in candidates if not c.accepted]
-                    st.write(f"**{len(accepted)} accepted, {len(rejected)} rejected** out of {len(candidates)} candidate region(s).")
-
-                    for i, c in enumerate(accepted, start=1):
-                        st.caption(
-                            f"Hole #{i}: confidence {c.confidence_score * 100:.0f}% ({c.confidence_label}) · "
-                            f"center ({c.cx:.1f}, {c.cy:.1f}) · equivalent diameter {c.equiv_diameter_px:.1f}px"
-                            + (" · Hough-confirmed" if c.hough_confirmed else "")
-                        )
-
-                    if rejected:
-                        st.write("Rejected candidates:")
-                        for c in rejected[:50]:
-                            st.caption(
-                                f"- center ({c.cx:.1f}, {c.cy:.1f}), diameter {c.equiv_diameter_px:.1f}px — "
-                                + "; ".join(c.rejection_reasons)
-                            )
-                        if len(rejected) > 50:
-                            st.caption(f"...and {len(rejected) - 50} more rejected candidates.")
-
-            if advanced_mode:
-                with st.expander("Full measurement table & tolerances"):
+            if st.session_state.get(details_key):
+                with st.expander("Full measurement record", expanded=True):
                     table_rows = [{
                         "Feature": r.feature, "Category": r.category,
                         "Pixel": "—" if r.px_value is None else f"{r.px_value:.2f}",
@@ -475,6 +815,23 @@ elif step == 2:
                     } for r in records]
                     st.dataframe(table_rows, use_container_width=True, hide_index=True, height=380)
 
+            st.markdown("#### Measurement Table")
+            if circles:
+                table_html = inspection_view.build_measurement_table_html(
+                    circles, records, tol_by_feature, selected_short_id=selected_short_id, decimals=decimals,
+                )
+                st.markdown(f'<div class="mv-panel">{table_html}</div>', unsafe_allow_html=True)
+            else:
+                st.caption("No circular features detected for this part.")
+
+            geometry_table_html = inspection_view.build_geometry_table_html(records, decimals=decimals)
+            if geometry_table_html:
+                st.markdown("#### Geometry (reliable corner radii / angles)")
+                st.caption("Only fitted corners with a tight, verified circle fit are shown — no guessed radii.")
+                st.markdown(f'<div class="mv-panel">{geometry_table_html}</div>', unsafe_allow_html=True)
+
+            if advanced_mode:
+                with st.expander("Full measurement table & tolerances (advanced)"):
                     if profile_for_image is not None:
                         res = measurement.resolution_uncertainty_mm(profile_for_image)
                         st.caption(
@@ -498,14 +855,14 @@ elif step == 2:
                             tol = st.number_input(f"{feat} — tolerance ± (mm)", min_value=0.0, value=0.1, key=f"{key_prefix}_{feat}_tol", format="%.3f")
                         spec_dict[feat] = ToleranceSpec(feature=feat, nominal_mm=nominal, tolerance_mm=tol)
 
-                    tolerance_results = measurement.apply_tolerances(records, spec_dict) if spec_dict else []
-                    if tolerance_results:
+                    advanced_tolerance_results = measurement.apply_tolerances(records, spec_dict) if spec_dict else []
+                    if advanced_tolerance_results:
                         tol_rows = [{
                             "Feature": t.feature, "Nominal (mm)": t.nominal_mm, "Tolerance (±mm)": t.tolerance_mm,
                             "Min (mm)": round(t.min_mm, 3), "Max (mm)": round(t.max_mm, 3),
                             "Measured (mm)": "—" if t.measured_mm is None else f"{t.measured_mm:.3f}",
                             "Status": t.status,
-                        } for t in tolerance_results]
+                        } for t in advanced_tolerance_results]
                         st.dataframe(tol_rows, use_container_width=True, hide_index=True)
 
             st.session_state["batch_results"][uf.name] = {
@@ -515,6 +872,7 @@ elif step == 2:
                 "tolerance_results": measurement.apply_tolerances(
                     records, st.session_state["tolerance_specs"].get(uf.name, {})
                 ),
+                "timestamp": timestamp,
             }
 
     st.divider()
@@ -536,13 +894,11 @@ else:
     if not results:
         st.info("Nothing to export yet — go back to Step 2 and measure at least one image first.")
     else:
-        from utils import export
-
         all_rows = []
         for image_name, data in results.items():
-            all_rows.extend(export.measurement_rows(image_name, data["records"]))
+            all_rows.extend(export_utils.measurement_rows(image_name, data["records"]))
 
-        csv_text = export.rows_to_csv(all_rows)
+        csv_text = export_utils.rows_to_csv(all_rows)
         st.download_button(
             "⬇️ Download all results (CSV)", data=csv_text,
             file_name="measurement_results.csv", mime="text/csv", type="primary",
@@ -551,7 +907,7 @@ else:
         st.markdown("#### Per-image report")
         image_name = st.selectbox("Select image", list(results.keys()))
         data = results[image_name]
-        report_text = export.build_report_text(
+        report_text = export_utils.build_report_text(
             image_name, data["records"], data["profile"], data["quality"], data["tolerance_results"],
         )
         st.text_area("Report preview", report_text, height=350)
