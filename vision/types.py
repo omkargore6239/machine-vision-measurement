@@ -18,6 +18,40 @@ CONFIDENCE_LOW = "LOW"
 
 MM_UNAVAILABLE_STATUS = "MM measurement unavailable — calibration required"
 
+# In real industrial inspection, what gets measured is driven by an
+# engineering drawing/spec, not "detect everything the algorithm can find".
+# These names are the vocabulary a future characteristic-driven inspection
+# config would use (e.g. "require exactly 4 HOLE_DIAMETER features within
+# tolerance X, plus 1 INNER_DIAMETER"). Nothing currently enforces or
+# consumes these beyond naming — this is deliberately just the shared
+# vocabulary/scaffolding asked for, not a full spec-driven inspection engine
+# (that's a materially larger feature, out of scope for this change).
+CHARACTERISTIC_OVERALL_WIDTH = "overall_width"
+CHARACTERISTIC_OVERALL_HEIGHT = "overall_height"
+CHARACTERISTIC_OUTER_DIAMETER = "outer_diameter"
+CHARACTERISTIC_INNER_DIAMETER = "inner_diameter"
+CHARACTERISTIC_HOLE_DIAMETER = "hole_diameter"
+CHARACTERISTIC_HOLE_COUNT = "hole_count"
+CHARACTERISTIC_HOLE_PITCH = "hole_pitch"
+CHARACTERISTIC_HOLE_POSITION = "hole_position"
+CHARACTERISTIC_EDGE_DISTANCE = "edge_distance"
+CHARACTERISTIC_RADIUS = "radius"
+CHARACTERISTIC_ANGLE = "angle"
+
+
+@dataclass
+class InspectionCharacteristic:
+    """One required-to-inspect characteristic, as it would come from an
+    engineering drawing/spec — the intended hook point for a future
+    "configure what to check" UI. `feature_ref` optionally ties it to a
+    specific feature's short_id (e.g. "H1", "CB"); left None for whole-part
+    characteristics like overall width. Not yet wired into the pipeline."""
+
+    characteristic_type: str
+    feature_ref: Optional[str] = None
+    nominal_mm: Optional[float] = None
+    tolerance_mm: Optional[float] = None
+
 
 @dataclass
 class CalibrationProfile:
@@ -73,6 +107,32 @@ class DetectedPart:
 
 
 @dataclass
+class SegmentationDiagnostics:
+    """The full evidence behind the outer-boundary accept/reject decision —
+    Vision Debug Mode's boundary panel shows all of this. `extent` (fill
+    ratio vs. the rotated bounding rectangle) is deliberately NOT part of the
+    accept/reject logic: it's informational only, since a legitimately
+    concave/open part (a C-bracket, a fork, an L-shape) has a lot of
+    intentional empty space in its own bounding rectangle. Reliability is
+    instead judged from solidity (vs. the part's own convex hull, which
+    only "fills in" genuine concavities) and boundary compactness (a proxy
+    for how jagged/noisy the contour is), neither of which penalize shape."""
+
+    area_px2: float
+    perimeter_px: float
+    bbox_area_px2: float
+    rotated_rect_area_px2: float
+    extent: float                  # informational only — see class docstring
+    convex_hull_area_px2: float
+    solidity: float                # area / convex-hull area
+    compactness: float             # perimeter / (2*sqrt(pi*area)); 1.0 = perfect circle
+    area_fraction_of_image: float
+    touches_border: bool
+    accepted: bool
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass
 class CircleFeature:
     """A hole/circular feature that has already passed every acceptance gate
     in `vision.geometry` — this is the reported, trustworthy result. See
@@ -92,6 +152,13 @@ class CircleFeature:
     solidity: Optional[float] = None
     confidence_score: Optional[float] = None  # 0-1 continuous score behind `confidence`
     hough_confirmed: bool = False
+
+    # Set by `measurement.classify_and_label_circles` (not by detection
+    # itself — geometry has no notion of "which hole is the bore", only
+    # measurement/reporting does). Empty/"hole" until then.
+    feature_type: str = "hole"  # "hole" | "bore"
+    label: str = ""             # e.g. "Hole 1", "Center Bore"
+    short_id: str = ""          # e.g. "H1", "CB"
 
 
 @dataclass

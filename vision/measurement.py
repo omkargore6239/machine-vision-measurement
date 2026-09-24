@@ -8,6 +8,9 @@ single place that guarantees the "never fabricate mm" rule: every record's
 from __future__ import annotations
 
 import itertools
+import math
+
+import cv2
 
 from vision import calibration, geometry
 from vision.types import (
@@ -15,6 +18,16 @@ from vision.types import (
     ToleranceResult, ToleranceSpec,
     CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, MM_UNAVAILABLE_STATUS,
 )
+
+# A circular feature is classified as the "Center Bore" (rather than just
+# another "Hole N") when it's both clearly the largest and sits near the
+# part's centroid — heuristic thresholds, not a CAD-aware feature
+# classifier. With only one circular feature present, "clearly the largest"
+# is trivially true, so a single large centered hole is still called the
+# bore (spec: a lone central bore must still be recognized as one).
+BORE_MIN_DIAMETER_FRACTION_OF_PART = 0.15   # vs sqrt(part area), a scale-robust size proxy
+BORE_MIN_CENTROID_PROXIMITY_FRACTION = 0.18  # vs sqrt(part area)
+BORE_MIN_SIZE_RATIO_VS_OTHERS = 1.4
 
 
 def _record(feature: str, category: str, px_value: float | None,
@@ -54,6 +67,92 @@ def convert_point_to_mm(px_point: tuple[float, float], origin_px: tuple[float, f
     return dx * profile.mm_per_pixel, dy * profile.mm_per_pixel
 
 
+def classify_and_label_circles(circles: list[CircleFeature], part: DetectedPart) -> list[CircleFeature]:
+    """Labels each detected circular feature as "Hole N" or "Center Bore"
+    (see module-level constants for the heuristic). Geometry detection has
+    no notion of "which one is the bore" — that's a reporting/labeling
+    concern, which is why this lives here rather than in vision.geometry.
+    Mutates and returns the same list."""
+    if not circles:
+        return circles
+
+    M = cv2.moments(part.contour)
+    if M["m00"] > 0:
+        centroid = (M["m10"] / M["m00"], M["m01"] / M["m00"])
+    else:
+        x, y, w, h = part.bbox
+        centroid = (x + w / 2, y + h / 2)
+
+    part_scale = math.sqrt(part.area_px2) if part.area_px2 > 0 else 0.0
+
+    diameters = [2 * c.r for c in circles]
+    max_d = max(diameters)
+    max_idx = diameters.index(max_d)
+    others = [d for i, d in enumerate(diameters) if i != max_idx]
+    median_other = sorted(others)[len(others) // 2] if others else None
+
+    bore_idx = None
+    if part_scale > 0:
+        candidate = circles[max_idx]
+        dist_to_centroid = geometry.euclidean_distance((candidate.cx, candidate.cy), centroid)
+        near_center = dist_to_centroid <= BORE_MIN_CENTROID_PROXIMITY_FRACTION * part_scale
+        large_enough = max_d >= BORE_MIN_DIAMETER_FRACTION_OF_PART * part_scale
+        clearly_largest = median_other is None or (
+            median_other > 0 and max_d / median_other >= BORE_MIN_SIZE_RATIO_VS_OTHERS
+        )
+        if near_center and large_enough and clearly_largest:
+            bore_idx = max_idx
+
+    hole_n = 0
+    for i, c in enumerate(circles):
+        if i == bore_idx:
+            c.feature_type, c.label, c.short_id = "bore", "Center Bore", "CB"
+        else:
+            hole_n += 1
+            c.feature_type, c.label, c.short_id = "hole", f"Hole {hole_n}", f"H{hole_n}"
+
+    return circles
+
+
+def build_feature_summary_table(
+    circles: list[CircleFeature],
+    profile: CalibrationProfile | None,
+    origin_px: tuple[float, float],
+    tolerance_results: list[ToleranceResult] | None = None,
+) -> list[dict]:
+    """The compact per-feature table the spec asks for: one row per circular
+    feature with X/Y/diameter/confidence/tolerance/result together, as
+    opposed to `build_measurement_records`'s long format (one row per
+    attribute, used for the full detailed table and CSV export)."""
+    tol_by_feature = {t.feature: t for t in (tolerance_results or [])}
+    rows = []
+    for c in circles:
+        label = c.label or f"Hole {c.circle_id}"
+        diameter_px = 2 * c.r
+        diameter_mm = calibration.apply_calibration(diameter_px, profile)
+        pt_mm = convert_point_to_mm((c.cx, c.cy), origin_px, profile)
+
+        if pt_mm is not None:
+            x_val, y_val, unit, diam_val = pt_mm[0], pt_mm[1], "mm", diameter_mm
+        else:
+            x_val, y_val, unit = c.cx - origin_px[0], c.cy - origin_px[1], "px"
+            diam_val = diameter_px
+
+        tol = tol_by_feature.get(f"{label} Equivalent Diameter")
+        rows.append({
+            "Feature": c.short_id or label,
+            "Type": "Central Bore" if c.feature_type == "bore" else "Hole",
+            "X": round(x_val, 3),
+            "Y": round(y_val, 3),
+            "Diameter": round(diam_val, 3) if diam_val is not None else None,
+            "Unit": unit,
+            "Confidence": c.confidence,
+            "Tolerance": f"±{tol.tolerance_mm:g}" if tol else "—",
+            "Result": tol.status if tol else "N/A",
+        })
+    return rows
+
+
 def build_measurement_records(
     part: DetectedPart,
     circles: list[CircleFeature],
@@ -80,27 +179,28 @@ def build_measurement_records(
     origin = origin_px or (float(x), float(y))
 
     for c in circles:
-        prefix = f"Hole {c.circle_id}"
-        records.append(_record(f"{prefix} Equivalent Diameter", "Holes", 2 * c.r, profile, confidence=c.confidence))
-        records.append(_record(f"{prefix} Radius", "Holes", c.r, profile, confidence=c.confidence))
+        prefix = c.label or f"Hole {c.circle_id}"
+        category = "Center Bore" if c.feature_type == "bore" else "Holes"
+        records.append(_record(f"{prefix} Equivalent Diameter", category, 2 * c.r, profile, confidence=c.confidence))
+        records.append(_record(f"{prefix} Radius", category, c.r, profile, confidence=c.confidence))
         if c.major_px is not None and c.minor_px is not None:
             # An ellipse fit exists — report major/minor separately (a
             # circular hole photographed at an angle can appear elliptical;
             # see vision.geometry's hole-detection docstring).
-            records.append(_record(f"{prefix} Major Diameter", "Holes", c.major_px, profile, confidence=c.confidence))
-            records.append(_record(f"{prefix} Minor Diameter", "Holes", c.minor_px, profile, confidence=c.confidence))
+            records.append(_record(f"{prefix} Major Diameter", category, c.major_px, profile, confidence=c.confidence))
+            records.append(_record(f"{prefix} Minor Diameter", category, c.minor_px, profile, confidence=c.confidence))
 
         cx_mm_pt = convert_point_to_mm((c.cx, c.cy), origin, profile)
         cx_val = c.cx - origin[0]
         cy_val = c.cy - origin[1]
         records.append(MeasurementRecord(
-            feature=f"{prefix} Center X", category="Holes",
+            feature=f"{prefix} Center X", category=category,
             px_value=cx_val, mm_value=(cx_mm_pt[0] if cx_mm_pt else None),
             unit_px="px", unit_mm="mm", confidence=c.confidence,
             status="Measured" if cx_mm_pt else MM_UNAVAILABLE_STATUS,
         ))
         records.append(MeasurementRecord(
-            feature=f"{prefix} Center Y", category="Holes",
+            feature=f"{prefix} Center Y", category=category,
             px_value=cy_val, mm_value=(cx_mm_pt[1] if cx_mm_pt else None),
             unit_px="px", unit_mm="mm", confidence=c.confidence,
             status="Measured" if cx_mm_pt else MM_UNAVAILABLE_STATUS,
@@ -112,8 +212,10 @@ def build_measurement_records(
     for a, b in itertools.combinations(circles, 2):
         dist_px = geometry.euclidean_distance((a.cx, a.cy), (b.cx, b.cy))
         confidence = CONFIDENCE_HIGH if a.confidence == CONFIDENCE_HIGH and b.confidence == CONFIDENCE_HIGH else CONFIDENCE_MEDIUM
+        label_a = a.label or f"Hole {a.circle_id}"
+        label_b = b.label or f"Hole {b.circle_id}"
         records.append(_record(
-            f"Hole {a.circle_id} to Hole {b.circle_id} (center distance)",
+            f"{label_a} to {label_b} (center distance)",
             "Distances", dist_px, profile, confidence=confidence,
         ))
 

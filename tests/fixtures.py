@@ -180,6 +180,50 @@ def make_busy_product_photo(
     return img, {"bbox": rect_xywh, "holes": real_holes}
 
 
+def make_c_shape_part(
+    canvas_hw: tuple[int, int] = (700, 700), center: tuple[int, int] = (350, 350),
+    arc_radius: int = 200, arm_width: int = 70,
+    start_angle: float = 200, end_angle: float = 340,
+    bg_value: int = 30, fg_value: int = 190,
+) -> tuple[np.ndarray, dict]:
+    """An open/concave C- or U-bracket shape — a thick partial ring with a
+    genuine gap, like the real forged component this fixture was built
+    against. Deliberately has a LOW bounding-rectangle extent (the opening
+    is real, empty, intentional space) so it exercises the same "is this
+    reliable" question a naive rectangle-fill check gets wrong."""
+    H, W = canvas_hw
+    gray = np.full((H, W), bg_value, dtype=np.uint8)
+    cv2.ellipse(gray, center, (arc_radius, arc_radius), 0, start_angle, end_angle, fg_value, arm_width)
+    img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    return img, {"center": center, "arc_radius": arc_radius, "arm_width": arm_width}
+
+
+def make_jagged_noise_blob(
+    canvas_hw: tuple[int, int] = (500, 500), center: tuple[int, int] = (250, 250),
+    base_radius: int = 120, spike_count: int = 40, spike_variation: int = 90,
+    bg_value: int = 30, fg_value: int = 190, seed: int = 3,
+) -> tuple[np.ndarray, dict]:
+    """A deliberately jagged, star-burst-shaped blob — simulates a genuinely
+    noisy/fragmented segmentation (not a legitimate industrial part shape),
+    used to confirm the solidity/compactness gates still reject real noise
+    even though the bounding-rect-fill gate they replaced is gone."""
+    H, W = canvas_hw
+    gray = np.full((H, W), bg_value, dtype=np.uint8)
+    rng = np.random.RandomState(seed)
+
+    angles = np.linspace(0, 2 * math.pi, spike_count, endpoint=False)
+    pts = []
+    for a in angles:
+        r = base_radius + rng.randint(-spike_variation, spike_variation)
+        r = max(10, r)
+        pts.append((int(center[0] + r * math.cos(a)), int(center[1] + r * math.sin(a))))
+    pts = np.array([pts], dtype=np.int32)
+    cv2.fillPoly(gray, pts, fg_value)
+
+    img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    return img, {"center": center}
+
+
 def make_checkerboard_image(
     square_px: int = 40, cols_inner: int = 7, rows_inner: int = 5, margin: int = 60,
 ) -> np.ndarray:

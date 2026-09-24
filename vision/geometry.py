@@ -27,9 +27,29 @@ MAX_INTERIOR_STD = 22.0         # std dev WITHIN the interior; high = not a cons
                                  # (catches ring/stroke shapes like printed "O"/"0"/"Q"/"8" text,
                                  # whose outer boundary alone looks deceptively hole-like — see
                                  # `_local_contrast_and_uniformity`'s docstring)
+MIN_DARK_MAJORITY_FRACTION = 0.25  # if the interior is at least this dark-majority, a high
+                                    # interior_std is treated as "real cavity + a highlight",
+                                    # not "hollow ring" — see `_local_contrast_and_uniformity`.
+                                    # Calibrated against real data: every synthetic text-glyph
+                                    # artifact tested scores exactly 0.00 (ink is a thin minority
+                                    # stroke), while a real photographed bore with a strong internal
+                                    # specular highlight scored 0.35 — this sits with margin on
+                                    # both sides of that gap, not centered arbitrarily.
 MIN_EDGE_STRENGTH = 18.0        # mean Sobel gradient magnitude along the boundary
-MIN_DIAMETER_PX = 6.0           # anything smaller is unmeasurable/noise-prone regardless of image size
+MIN_DIAMETER_PX = 12.0          # anything smaller is unmeasurable/noise-prone regardless of image size —
+                                 # also the safety margin above the ~8px inner gap of a letter like "O"/
+                                 # "Q"/"8" in printed text at ordinary scale, confirmed via a synthetic
+                                 # test: recovering genuinely nested hole candidates (see
+                                 # `segmentation._find_contours_excluding_hole_traces`) also recovers a
+                                 # text glyph's own tiny inner gap as a candidate at that scale
 MIN_CONFIDENCE_SCORE_TO_ACCEPT = 0.55  # 0-1 aggregate score, see `_confidence_score`
+MAX_AREA_FRACTION_OF_PART = 0.55       # a candidate this large relative to the part is suspect —
+                                        # sanity ceiling, not a cap on legitimate large bores (a
+                                        # bore up to ~74% of the outer diameter still clears this)
+MIN_EDGE_MARGIN_FRACTION = 0.03        # candidate center must be at least this far (as a fraction
+                                        # of sqrt(part area), a scale-robust "characteristic size")
+                                        # from the part's TRUE outer boundary — not its bounding
+                                        # box, which is a poor proxy for a circular/irregular part
 
 # Points/circle centers within this many pixels are treated as the same
 # physical feature (both for Hough<->contour cross-checking and final dedup).
@@ -39,6 +59,13 @@ DEDUP_DISTANCE_PX = 12.0
 # (4*pi*Area/Perimeter^2, 1.0 = perfect circle) to be trusted at all.
 MIN_CIRCULARITY_TO_ACCEPT = MIN_CIRCULARITY  # kept for backwards-compat readability
 MIN_CIRCULARITY_FOR_HIGH_CONFIDENCE = 0.90
+
+# Absolute 0-255 gray level considered "genuinely dark" — used by
+# `_local_contrast_and_uniformity`'s dark_majority_fraction (see its
+# docstring): distinguishes a real cavity with an internal highlight
+# (majority dark) from a hollow ring/stroke (minority dark) when both have
+# similarly high interior_std.
+DARK_PIXEL_THRESHOLD = 60
 
 # --- corner radius fit thresholds -------------------------------------------------
 MIN_CORNER_FIT_POINTS = 6
@@ -150,8 +177,8 @@ def _fit_ellipse_safe(contour: np.ndarray) -> tuple[float, float, float, float, 
 
 def _local_contrast_and_uniformity(
     gray: np.ndarray, contour: np.ndarray, outer_mask: np.ndarray,
-) -> tuple[float, float]:
-    """Returns (contrast, interior_std).
+) -> tuple[float, float, float]:
+    """Returns (contrast, interior_std, dark_majority_fraction).
 
     `contrast` = |mean interior intensity - mean intensity of a thin ring
     just outside the candidate, still inside the part|. A real hole reads as
@@ -167,7 +194,18 @@ def _local_contrast_and_uniformity(
     boundary. The filled interior of a real hole is one consistent surface
     (low std); the "filled interior" of a ring is actually a mix of ink and
     the surrounding material peeking through its hollow center (high std).
-    This is the "consistent interior region" a real hole has, per spec.
+
+    But high interior_std ALSO occurs for a real, deep, uniformly-dark hole
+    that happens to have a specular highlight in it (confirmed on a real
+    polished-metal part: circularity 0.82, solidity 0.98 — clearly a hole
+    shape — with interior_std 94, clearly failing the uniformity check on
+    its own). `dark_majority_fraction` — the fraction of the interior that's
+    genuinely near-black — is what tells these apart: a real cavity's
+    interior is MOSTLY dark with a minority bright streak, so this is high;
+    a hollow ring/stroke's "filled" interior is mostly the surrounding
+    material peeking through its hollow center, so this is low, even though
+    both cases can have similarly high interior_std. See MAX_INTERIOR_STD's
+    use below for how the two combine.
     """
     x, y, w, h = cv2.boundingRect(contour)
     H, W = gray.shape
@@ -186,14 +224,15 @@ def _local_contrast_and_uniformity(
     ring_mask = cv2.bitwise_and(ring_mask, local_outer)
 
     if cv2.countNonZero(interior_mask) == 0 or cv2.countNonZero(ring_mask) == 0:
-        return 0.0, 255.0
+        return 0.0, 255.0, 0.0
 
     interior_vals = local_gray[interior_mask == 255].astype(np.float64)
     interior_mean = float(np.mean(interior_vals))
     interior_std = float(np.std(interior_vals))
+    dark_majority_fraction = float(np.mean(interior_vals < DARK_PIXEL_THRESHOLD))
     ring_mean = cv2.mean(local_gray, mask=ring_mask)[0]
     contrast = abs(interior_mean - ring_mean)
-    return contrast, interior_std
+    return contrast, interior_std, dark_majority_fraction
 
 
 def _boundary_edge_strength(grad_mag: np.ndarray, contour: np.ndarray) -> float:
@@ -245,16 +284,27 @@ def evaluate_hole_candidates(
     hole_contours: list[np.ndarray],
     hough_hits: list[dict],
     part_area_px2: float,
+    outer_contour: np.ndarray | None = None,
 ) -> list[HoleCandidate]:
     """The actual accept/reject decision. Every raw candidate from
     `segmentation.extract_hole_contours` is evaluated against every gate and
     kept in the returned list REGARDLESS of outcome (with `.accepted` and
     `.rejection_reasons` set) — Vision Debug Mode uses the full list; normal
     measurement uses only the accepted ones via
-    `hole_candidates_to_circle_features`."""
+    `hole_candidates_to_circle_features`.
+
+    `outer_contour` (the part's true outer boundary, not just its bounding
+    box) enables an accurate "is this candidate actually well inside the
+    part" check — a bounding-box-edge proxy is a poor fit for a circular or
+    irregular part, where most of the bbox near its corners isn't part
+    material at all. Optional for backward compatibility with callers that
+    only have a mask; the position gate is simply skipped when omitted.
+    """
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     grad_mag = cv2.magnitude(gx, gy)
+    part_scale = math.sqrt(part_area_px2) if part_area_px2 > 0 else 0.0
+    min_edge_margin = max(5.0, MIN_EDGE_MARGIN_FRACTION * part_scale)
 
     hough_used = [False] * len(hough_hits)
     results: list[HoleCandidate] = []
@@ -283,7 +333,7 @@ def evaluate_hole_candidates(
         else:
             cx, cy = ecx, ecy
 
-        contrast, interior_std = _local_contrast_and_uniformity(gray, c, outer_mask)
+        contrast, interior_std, dark_majority_fraction = _local_contrast_and_uniformity(gray, c, outer_mask)
         edge_strength = _boundary_edge_strength(grad_mag, c)
 
         hough_confirmed = False
@@ -308,13 +358,27 @@ def evaluate_hole_candidates(
             reasons.append(f"Too elongated (aspect ratio {aspect_ratio:.2f} > {MAX_ASPECT_RATIO:.2f})")
         if contrast < MIN_CONTRAST:
             reasons.append(f"Weak contrast vs surrounding material ({contrast:.1f} < {MIN_CONTRAST:.1f})")
-        if interior_std > MAX_INTERIOR_STD:
-            reasons.append(f"Interior is not a consistent surface (std {interior_std:.1f} > {MAX_INTERIOR_STD:.1f}) — "
-                            f"looks like a stroke/ring (e.g. text) rather than a filled hole")
+        if interior_std > MAX_INTERIOR_STD and dark_majority_fraction < MIN_DARK_MAJORITY_FRACTION:
+            # High variance alone doesn't distinguish a real cavity with an
+            # internal highlight from a hollow ring/stroke — both can have
+            # it. What tells them apart is whether dark pixels are still the
+            # MAJORITY of the interior (a cavity, even a highlighted one) or
+            # the minority (a hollow shape's "filled" interior is mostly
+            # background peeking through). Only reject when both signals
+            # agree something is wrong.
+            reasons.append(f"Interior is not a consistent surface (std {interior_std:.1f} > {MAX_INTERIOR_STD:.1f}, "
+                            f"and only {dark_majority_fraction:.0%} of it is dark) — looks like a stroke/ring "
+                            f"(e.g. text) rather than a filled hole")
         if edge_strength < MIN_EDGE_STRENGTH:
             reasons.append("Weak/soft boundary edges")
         if equiv_diameter < MIN_DIAMETER_PX:
             reasons.append(f"Too small to measure reliably (<{MIN_DIAMETER_PX:.0f}px)")
+        if part_area_px2 > 0 and (area / part_area_px2) > MAX_AREA_FRACTION_OF_PART:
+            reasons.append(f"Too large relative to the part ({area / part_area_px2:.0%} of part area)")
+        if outer_contour is not None:
+            edge_margin = distance_to_contour(outer_contour, (cx, cy))
+            if edge_margin < min_edge_margin:
+                reasons.append(f"Too close to the part's outer edge ({edge_margin:.1f}px margin)")
 
         score = _confidence_score(circularity, solidity, aspect_ratio, contrast, interior_std, edge_strength, hough_confirmed)
         if not reasons and score < MIN_CONFIDENCE_SCORE_TO_ACCEPT:
@@ -337,22 +401,52 @@ def evaluate_hole_candidates(
     return _dedup_candidates(results)
 
 
+IOU_DEDUP_THRESHOLD = 0.3  # two candidate disks overlapping this much are the same physical hole
+
+
+def _circle_iou(cx1: float, cy1: float, r1: float, cx2: float, cy2: float, r2: float) -> float:
+    """Intersection-over-union of two disks. Needed (rather than plain
+    center-distance) because the boundary/rim pathway can produce several
+    Hough fits of different radius for the SAME physical hole — e.g. one
+    circle tightly on the true rim and another looser one whose center is
+    tens of pixels off; a fixed center-distance cutoff misses those, but
+    their disks still overlap heavily."""
+    d = euclidean_distance((cx1, cy1), (cx2, cy2))
+    if d >= r1 + r2:
+        return 0.0
+    if d <= abs(r1 - r2):
+        inter = math.pi * min(r1, r2) ** 2
+    else:
+        r1_sq, r2_sq, d_sq = r1 ** 2, r2 ** 2, d ** 2
+        alpha = math.acos(float(np.clip((d_sq + r1_sq - r2_sq) / (2 * d * r1), -1.0, 1.0)))
+        beta = math.acos(float(np.clip((d_sq + r2_sq - r1_sq) / (2 * d * r2), -1.0, 1.0)))
+        inter = r1_sq * (alpha - math.sin(2 * alpha) / 2) + r2_sq * (beta - math.sin(2 * beta) / 2)
+    union = math.pi * r1 ** 2 + math.pi * r2 ** 2 - inter
+    return inter / union if union > 0 else 0.0
+
+
 def _dedup_candidates(candidates: list[HoleCandidate]) -> list[HoleCandidate]:
-    """Defensive final dedup among ACCEPTED candidates by center proximity —
-    the two Otsu partitions that generate candidates are complementary so
-    this shouldn't normally trigger, but guards against any future extra
-    candidate source double-counting the same physical hole. Keeps the
-    higher-confidence one and marks the other rejected as a duplicate."""
+    """Defensive final dedup among ACCEPTED candidates by disk overlap (IoU)
+    — the two Otsu partitions that generate region candidates are
+    complementary so this rarely triggers for them, but the boundary/rim
+    pathway commonly produces several differently-sized Hough fits for the
+    same physical hole, which this collapses to the single
+    highest-confidence one."""
     accepted_idx = [i for i, c in enumerate(candidates) if c.accepted]
     accepted_idx.sort(key=lambda i: candidates[i].confidence_score, reverse=True)
 
     kept: list[int] = []
     for i in accepted_idx:
         c = candidates[i]
+        c_r = c.equiv_diameter_px / 2.0
         is_dup = False
         for j in kept:
             k = candidates[j]
+            k_r = k.equiv_diameter_px / 2.0
             if euclidean_distance((c.cx, c.cy), (k.cx, k.cy)) <= DEDUP_DISTANCE_PX:
+                is_dup = True
+                break
+            if _circle_iou(c.cx, c.cy, c_r, k.cx, k.cy, k_r) >= IOU_DEDUP_THRESHOLD:
                 is_dup = True
                 break
         if is_dup:
@@ -370,13 +464,16 @@ def detect_holes(
     hole_contours: list[np.ndarray],
     bbox: tuple[int, int, int, int],
     part_area_px2: float,
+    outer_contour: np.ndarray | None = None,
 ) -> tuple[list[CircleFeature], list[HoleCandidate]]:
     """Convenience wrapper tying together Hough cross-checking, full
     candidate evaluation, and conversion to the final reportable list.
     Returns (accepted_circles, all_candidates) — the second is what Vision
-    Debug Mode uses to show rejected candidates and why."""
+    Debug Mode uses to show rejected candidates and why. Pass the part's
+    `outer_contour` (e.g. `part.contour`) for an accurate edge-distance
+    check on non-rectangular parts."""
     hough_hits = detect_circles_hough(gray, outer_mask, bbox)
-    candidates = evaluate_hole_candidates(gray, outer_mask, hole_contours, hough_hits, part_area_px2)
+    candidates = evaluate_hole_candidates(gray, outer_mask, hole_contours, hough_hits, part_area_px2, outer_contour)
     circles = hole_candidates_to_circle_features(candidates)
     return circles, candidates
 
@@ -386,9 +483,10 @@ def hole_candidates_to_circle_features(candidates: list[HoleCandidate]) -> list[
     converted to the `CircleFeature` shape the rest of the app consumes."""
     features = []
     for i, c in enumerate((x for x in candidates if x.accepted), start=1):
+        method = "hough+contour" if c.hough_confirmed else "contour"
         features.append(CircleFeature(
             circle_id=i, cx=c.cx, cy=c.cy, r=c.equiv_diameter_px / 2.0,
-            method="hough+contour" if c.hough_confirmed else "contour",
+            method=method,
             circularity=c.circularity, confidence=c.confidence_label,
             major_px=c.major_axis_px, minor_px=c.minor_axis_px,
             ellipse_angle_deg=c.ellipse_angle_deg, solidity=c.solidity,
