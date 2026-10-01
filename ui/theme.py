@@ -21,6 +21,19 @@ COLOR_WARN_BG = "#FEF3C7"
 COLOR_INFO = "#2563EB"
 COLOR_INFO_BG = "#DBEAFE"
 
+# Dark "HMI kiosk" palette for the compact default result card
+# (ui/inspection_view.build_hmi_result_html). Deliberately NOT part of the
+# global `_CSS`/`inject_theme_css` below — the rest of the app (including
+# the Advanced / Detailed View) keeps the light theme above unchanged; the
+# HMI card carries these as its own scoped <style> block instead.
+HMI_BG = "#14171C"
+HMI_SURFACE = "#1D2128"
+HMI_TEXT = "#F2F4F7"
+HMI_TEXT_MUTED = "#8B93A1"
+HMI_BORDER = "#2A2F38"
+HMI_PASS = "#22C55E"
+HMI_FAIL = "#EF4444"
+
 _CSS = f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600&display=swap');
@@ -371,6 +384,27 @@ table.mv-table tr.mv-row-selected td {{ background: {COLOR_INFO_BG}; }}
     font-variant-numeric: tabular-nums;
     color: {COLOR_TEXT};
     font-weight: 700;
+}}
+.mv-conf-low {{
+    color: {COLOR_WARN} !important;
+    font-weight: 600;
+}}
+.mv-conflict-block {{
+    background: {COLOR_WARN_BG};
+    border: 1px solid rgba(217,119,6,0.4);
+    border-radius: 4px;
+    padding: 6px 8px;
+    color: {COLOR_WARN};
+    font-family: 'Inter', sans-serif;
+    font-size: 0.74rem;
+    line-height: 1.5;
+    white-space: normal;
+    max-width: 320px;
+}}
+.mv-conflict-title {{
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    margin-bottom: 2px;
 }}
 
 @keyframes mvFadeUp {{

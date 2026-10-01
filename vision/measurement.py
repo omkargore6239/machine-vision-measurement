@@ -13,10 +13,13 @@ import math
 import cv2
 
 from vision import calibration, geometry
+from vision.inspection_spec import INSPECTION_SPEC
 from vision.types import (
-    CalibrationProfile, CircleFeature, DetectedPart, MeasurementRecord,
-    ToleranceResult, ToleranceSpec,
+    CalibrationProfile, CircleFeature, DetectedPart, MeasurementRecord, ParameterResult,
+    ToleranceDefinition, ToleranceResult, ToleranceSpec, bilateral,
     CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, MM_UNAVAILABLE_STATUS,
+    PARAM_STATUS_FAIL, PARAM_STATUS_INCOMPLETE, PARAM_STATUS_NOT_DETECTED, PARAM_STATUS_NOT_SPECIFIED,
+    PARAM_STATUS_PASS, PARAM_STATUS_SPEC_CONFLICT,
 )
 
 # A circular feature is classified as the "Center Bore" (rather than just
@@ -259,4 +262,281 @@ def apply_tolerances(records: list[MeasurementRecord],
             feature=feature, nominal_mm=spec.nominal_mm, tolerance_mm=spec.tolerance_mm,
             min_mm=min_mm, max_mm=max_mm, measured_mm=measured, status=status,
         ))
+    return results
+
+
+# --- product-specific inspection spec (fork bracket) --------------------------------
+#
+# Pure orchestration: calls the already-gated geometry functions
+# (`geometry.find_fork_tips` / `fit_concave_arc` / `measure_tip_thickness`,
+# plus the existing hole/dimension pipeline) and applies the
+# PASS/FAIL/INCOMPLETE/NOT-DETECTED rules. No new detection logic lives
+# here — see `vision.geometry` for the actual fork-geometry algorithms and
+# `vision.inspection_spec` for the parameter definitions/nominal values.
+
+def _fork_tip_geometry(part: DetectedPart) -> dict:
+    """Computes the shared fork-geometry evidence once (tips, inner-arc
+    fit, outer-arc fit, per-tip thickness) so every parameter that needs it
+    reuses the same result instead of recomputing. Every entry is None when
+    its own reliability gate wasn't cleared — never a guess."""
+    tips = geometry.find_fork_tips(part.contour, part.area_px2)
+    arc_fit = convex_arc_fit = None
+    thickness_a = thickness_b = None
+    if tips is not None:
+        arc_fit = geometry.fit_concave_arc(part.contour, tips["start_idx"], tips["end_idx"])
+        convex_arc_fit = geometry.fit_convex_arc(part.contour, tips["start_idx"], tips["end_idx"])
+        if arc_fit is not None:
+            ref_center = (arc_fit["cx"], arc_fit["cy"])
+            run = geometry._contour_run(part.contour, tips["start_idx"], tips["end_idx"])
+            inset = min(15, max(1, len(run) // 8))
+            if len(run) > 2 * inset:
+                thickness_a = geometry.measure_tip_thickness(part.mask, tuple(run[inset]), ref_center)
+                thickness_b = geometry.measure_tip_thickness(part.mask, tuple(run[-inset - 1]), ref_center)
+    return {
+        "tips": tips, "arc_fit": arc_fit, "convex_arc_fit": convex_arc_fit,
+        "thickness_a": thickness_a, "thickness_b": thickness_b,
+    }
+
+
+def evaluate_inspection_spec(
+    part: DetectedPart,
+    circles: list[CircleFeature],
+    records: list[MeasurementRecord],
+    profile: CalibrationProfile | None,
+    tolerance_overrides: dict[str, tuple[float, float]] | None = None,
+) -> list[ParameterResult]:
+    """Evaluates every parameter in `vision.inspection_spec.INSPECTION_SPEC`
+    against this part's actual detected geometry.
+
+    `tolerance_overrides` maps a `parameter_id` to an operator-configured
+    `(nominal_mm, tolerance_mm)` pair (always bilateral — the spec's own
+    positive-only/negative-only/none tolerances are used until the operator
+    explicitly overrides one). An override on a conflict-flagged parameter
+    counts as the "engineering confirmation" the conflict is waiting for —
+    it resolves that one parameter for this image; without an override, a
+    conflict is NEVER auto-resolved.
+
+    Status rules (seven states, not four):
+      - NOT DETECTED: the underlying feature/geometry wasn't found at all
+        (or the spec itself documents no measurable definition — see each
+        `ParameterSpec.not_detectable_reason`).
+      - INCOMPLETE: a real pixel measurement exists but no calibration is
+        active to convert it to mm, or the parameter is flagged as never
+        measurable from a single 2D photo (Part Thickness).
+      - NOT SPECIFIED: a real mm measurement exists but no approved
+        tolerance does — never guessed into a PASS or FAIL.
+      - SPECIFICATION CONFLICT: two candidate specs disagree on the nominal
+        (e.g. Overall Fork Width) and neither has been explicitly confirmed
+        via an override — the measured value is still shown, but no
+        PASS/FAIL is ever computed from it.
+      - PASS / FAIL: a real mm measurement exists and a real tolerance
+        (spec-defined or operator-overridden) says which side of the line
+        it's on.
+    """
+    overrides = tolerance_overrides or {}
+    fork = _fork_tip_geometry(part)
+    tips, arc_fit, convex_arc_fit = fork["tips"], fork["arc_fit"], fork["convex_arc_fit"]
+    thickness_a, thickness_b = fork["thickness_a"], fork["thickness_b"]
+
+    sorted_circles = sorted(circles, key=lambda c: c.r, reverse=True)
+    main_hole = next((c for c in circles if c.feature_type == "bore"), None) or (
+        sorted_circles[0] if sorted_circles else None
+    )
+    boss_hole = next((c for c in sorted_circles if c is not main_hole), None)
+
+    rec_by_feature = {r.feature: r for r in records}
+    results: list[ParameterResult] = []
+
+    for spec in INSPECTION_SPEC:
+        override = overrides.get(spec.parameter_id)
+        if override is not None:
+            nominal_mm, tolerance_def = override[0], bilateral(override[1])
+        else:
+            nominal_mm, tolerance_def = spec.nominal_mm, spec.tolerance
+        lower_mm, upper_mm = tolerance_def.limits(nominal_mm)
+
+        measured_px: float | None = None
+        confidence = "N/A"
+        method = ""
+        reason = ""
+        conflict_note = ""
+        debug: dict = {}
+
+        # --- SPECIFICATION CONFLICT: never auto-resolved, unless the
+        #     operator has explicitly overridden this parameter (that IS
+        #     the engineering confirmation the conflict was waiting for). --
+        if spec.conflicting_spec is not None and override is None:
+            other = spec.conflicting_spec
+            conflict_note = (
+                f"Existing parameter: {spec.nominal_mm:g} {spec.tolerance.display()}  |  "
+                f"Additional engineering list: {other.nominal_mm:g} {other.tolerance.display()}  |  "
+                f"Engineering confirmation required."
+            )
+            reason = "Two candidate specifications disagree on the nominal value. Override in Tolerance Configuration to confirm one."
+
+        if spec.requires_second_view:
+            method = "N/A -- requires a second camera/view or 3D measurement"
+            reason = ("Current 2D image does not provide reliable thickness geometry along the "
+                      "camera's depth axis. Requires a side-view camera, a second camera, a "
+                      "calibrated side image, or 3D measurement.")
+            results.append(ParameterResult(
+                spec.parameter_id, spec.name, spec.characteristic_type, spec.value_kind, nominal_mm,
+                tolerance_def.display(), lower_mm, upper_mm, None, "mm", None,
+                PARAM_STATUS_INCOMPLETE, confidence, method, reason, conflict_note, debug,
+            ))
+            continue
+
+        if spec.not_detectable_reason is not None:
+            results.append(ParameterResult(
+                spec.parameter_id, spec.name, spec.characteristic_type, spec.value_kind, nominal_mm,
+                tolerance_def.display(), lower_mm, upper_mm, None, "mm", None,
+                PARAM_STATUS_NOT_DETECTED, confidence, "not yet mapped to a documented geometric definition",
+                spec.not_detectable_reason, conflict_note, debug,
+            ))
+            continue
+
+        if spec.parameter_id == "main_hole_diameter":
+            method = "existing hole-detection pipeline (geometry.detect_holes) -- the classified bore, or largest accepted circle"
+            if main_hole is not None:
+                measured_px = 2 * main_hole.r
+                confidence = main_hole.confidence
+                debug = {"center_px": (main_hole.cx, main_hole.cy), "diameter_px": measured_px, "feature_type": main_hole.feature_type}
+            else:
+                reason = "No circular hole feature passed the existing detection gates."
+
+        elif spec.parameter_id == "top_boss_hole_diameter":
+            method = "existing hole-detection pipeline -- second-largest accepted circle, distinct from the main hole"
+            if boss_hole is not None:
+                measured_px = 2 * boss_hole.r
+                confidence = boss_hole.confidence
+                debug = {"center_px": (boss_hole.cx, boss_hole.cy), "diameter_px": measured_px}
+            else:
+                reason = "A second circular hole, distinct from the main hole, was not reliably detected."
+
+        elif spec.parameter_id == "overall_fork_width":
+            # Rotated Rect Width/Height (part.rotated_rect, cv2.minAreaRect)
+            # are the part's OWN minimum-area bounding rectangle -- tied to
+            # the part's shape, not the image's x/y axes, and already
+            # normalized rw >= rh (geometry.rotated_rect). The axis-aligned
+            # Bounding Box Width/Height swap values if the same part is
+            # photographed rotated 90 degrees; the rotated-rect ones don't.
+            method = "existing Rotated Rect Width record (part's own minimum bounding rectangle -- orientation-independent, unlike the axis-aligned bounding box)"
+            r = rec_by_feature.get("Rotated Rect Width")
+            if r is not None and r.px_value is not None:
+                measured_px = r.px_value
+                confidence = CONFIDENCE_HIGH
+                debug = {"source_record": "Rotated Rect Width"}
+            else:
+                reason = "Rotated-rect width was not available."
+
+        elif spec.parameter_id == "overall_height":
+            method = "existing Rotated Rect Height record (part's own minimum bounding rectangle -- orientation-independent, unlike the axis-aligned bounding box)"
+            r = rec_by_feature.get("Rotated Rect Height")
+            if r is not None and r.px_value is not None:
+                measured_px = r.px_value
+                confidence = CONFIDENCE_HIGH
+                debug = {"source_record": "Rotated Rect Height"}
+            else:
+                reason = "Rotated-rect height was not available."
+
+        elif spec.parameter_id == "hole_center_distance":
+            method = "euclidean distance between the two detected hole centers"
+            if main_hole is not None and boss_hole is not None:
+                measured_px = geometry.euclidean_distance((main_hole.cx, main_hole.cy), (boss_hole.cx, boss_hole.cy))
+                confidence = (CONFIDENCE_HIGH if main_hole.confidence == CONFIDENCE_HIGH and boss_hole.confidence == CONFIDENCE_HIGH
+                              else CONFIDENCE_MEDIUM)
+                debug = {"main_hole_center_px": (main_hole.cx, main_hole.cy), "boss_hole_center_px": (boss_hole.cx, boss_hole.cy)}
+            else:
+                reason = "Both the main hole and top boss hole must be reliably detected to compute center-to-center distance."
+
+        elif spec.parameter_id == "inner_arc_diameter":
+            method = "RANSAC circle fit to the concave inner-arc contour run (geometry.fit_concave_arc)"
+            if tips is None:
+                reason = "The part's contour doesn't show a single, clearly dominant concave opening (fork shape not confidently detected)."
+            elif arc_fit is None:
+                reason = "The inner-arc region didn't fit a single circle tightly or widely enough to trust (hub geometry or noise dominates)."
+            else:
+                measured_px = 2 * arc_fit["radius_px"]
+                confidence = CONFIDENCE_HIGH if arc_fit["inlier_fraction"] >= 0.75 else CONFIDENCE_MEDIUM
+                debug = {
+                    "fit_center_px": (arc_fit["cx"], arc_fit["cy"]), "radius_px": arc_fit["radius_px"],
+                    "inlier_fraction": arc_fit["inlier_fraction"], "angular_span_deg": arc_fit["angular_span_deg"],
+                    "rms_px": arc_fit["rms_px"],
+                }
+
+        elif spec.parameter_id == "fork_tip_gap":
+            method = "distance between the two fork tip corners (geometry.find_fork_tips)"
+            if tips is None:
+                reason = "Fork tip corners were not reliably identified from the contour (no single, dominant concave opening found)."
+            else:
+                measured_px = geometry.euclidean_distance(tips["tip_a"], tips["tip_b"])
+                confidence = CONFIDENCE_HIGH
+                debug = {"tip_a_px": tips["tip_a"], "tip_b_px": tips["tip_b"], "defect_depth_px": tips["depth_px"]}
+
+        elif spec.parameter_id == "fork_arm_length":
+            method = "distance from each fork tip corner to the main hole center, averaged (documented anchor: tip -> main hole center)"
+            if tips is None or main_hole is None:
+                reason = "Requires both reliable fork tips and a detected main hole."
+            else:
+                d_a = geometry.euclidean_distance(tips["tip_a"], (main_hole.cx, main_hole.cy))
+                d_b = geometry.euclidean_distance(tips["tip_b"], (main_hole.cx, main_hole.cy))
+                measured_px = (d_a + d_b) / 2
+                confidence = CONFIDENCE_MEDIUM
+                debug = {"arm_a_px": d_a, "arm_b_px": d_b, "anchor": "main hole center"}
+
+        elif spec.parameter_id == "fork_tip_thickness":
+            method = "mask ray-march outward from just inside each tip, perpendicular to the inner arc (geometry.measure_tip_thickness)"
+            vals = [t["thickness_px"] for t in (thickness_a, thickness_b) if t is not None]
+            if not vals:
+                reason = "Could not reliably measure material thickness at either fork tip."
+            else:
+                measured_px = sum(vals) / len(vals)
+                confidence = CONFIDENCE_HIGH if len(vals) == 2 else CONFIDENCE_MEDIUM
+                debug = {"tip_a": thickness_a, "tip_b": thickness_b}
+
+        elif spec.parameter_id in ("outer_arc_radius", "arc_radius"):
+            method = "RANSAC circle fit to the convex outer-arc contour run (geometry.fit_convex_arc)"
+            if tips is None:
+                reason = "The part's contour doesn't show a single, clearly dominant concave opening (fork shape not confidently detected)."
+            elif convex_arc_fit is None:
+                reason = "The outer-arc region didn't fit a single circle tightly or widely enough to trust."
+            else:
+                measured_px = convex_arc_fit["radius_px"]  # value_kind="radius" -- report the radius directly, never doubled
+                confidence = CONFIDENCE_HIGH if convex_arc_fit["inlier_fraction"] >= 0.75 else CONFIDENCE_MEDIUM
+                debug = {
+                    "fit_center_px": (convex_arc_fit["cx"], convex_arc_fit["cy"]), "radius_px": convex_arc_fit["radius_px"],
+                    "inlier_fraction": convex_arc_fit["inlier_fraction"], "angular_span_deg": convex_arc_fit["angular_span_deg"],
+                    "rms_px": convex_arc_fit["rms_px"],
+                    "note": "Same fitted outer-arc geometry as 'Outer Arc Radius'/'Arc Radius' -- the two given nominal "
+                            "candidates (62.00 vs 62.75) were not distinguished by any documented geometric difference.",
+                }
+
+        measured_mm: float | None = None
+        if measured_px is not None:
+            measured_mm = calibration.apply_calibration(measured_px, profile)
+            debug["pixel_measurement_px"] = measured_px
+            if profile is not None and profile.mm_per_pixel is not None:
+                debug["calibration_mm_per_px"] = profile.mm_per_pixel
+
+        if conflict_note:
+            status = PARAM_STATUS_SPEC_CONFLICT
+        elif measured_px is None:
+            status = PARAM_STATUS_NOT_DETECTED
+        elif measured_mm is None:
+            status = PARAM_STATUS_INCOMPLETE
+            reason = reason or "Feature detected in pixels, but no calibration is active to convert to mm."
+        elif not tolerance_def.has_tolerance:
+            status = PARAM_STATUS_NOT_SPECIFIED
+            reason = reason or "No approved tolerance exists for this characteristic -- measured value shown for reference only."
+        else:
+            status = PARAM_STATUS_PASS if lower_mm <= measured_mm <= upper_mm else PARAM_STATUS_FAIL
+
+        deviation_mm = (measured_mm - nominal_mm) if measured_mm is not None else None
+
+        results.append(ParameterResult(
+            spec.parameter_id, spec.name, spec.characteristic_type, spec.value_kind, nominal_mm,
+            tolerance_def.display(), lower_mm, upper_mm, measured_mm, "mm", deviation_mm, status,
+            confidence, method, reason, conflict_note, debug,
+        ))
+
     return results

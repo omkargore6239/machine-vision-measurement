@@ -4,7 +4,9 @@ import cv2
 import numpy as np
 
 from tests import fixtures
-from tests.fixtures import make_axis_aligned_part, make_circular_flange_part, make_rounded_rect_part
+from tests.fixtures import (
+    make_axis_aligned_part, make_circular_flange_part, make_fork_bracket_part, make_rounded_rect_part,
+)
 from vision import geometry, measurement, segmentation
 from vision.preprocessing import to_gray
 
@@ -31,6 +33,52 @@ def test_circle_detection_matches_ground_truth():
         assert abs(match.r - gr) <= DIAMETER_TOLERANCE_PX
         assert match.circularity is not None
         assert match.circularity >= geometry.MIN_CIRCULARITY
+
+
+def _make_scalloped_hole_part(scallop_amplitude_px=8, n_scallops=14, hole_radius=70):
+    """A rectangular part with one hole whose boundary is a scalloped/
+    jagged circle rather than a smooth one — mimicking the exact failure
+    mode found on a real photographed bore (a genuinely round, high-
+    solidity hole whose raw circularity read 0.63-0.68, well below
+    MIN_CIRCULARITY, purely from adaptive-threshold/rim-texture boundary
+    noise — see `geometry._smooth_contour_for_shape_metrics`'s docstring)."""
+    canvas_hw = (600, 800)
+    rect_xywh = (250, 200, 300, 200)
+    gray = np.full(canvas_hw, 40, dtype=np.uint8)
+    x, y, w, h = rect_xywh
+    gray[y:y + h, x:x + w] = 210
+    cx, cy = x + w // 2, y + h // 2
+    n_pts = n_scallops * 6
+    pts = []
+    for i in range(n_pts):
+        angle = 2 * math.pi * i / n_pts
+        bump = scallop_amplitude_px if (i // 3) % 2 == 0 else 0
+        r = hole_radius + bump
+        pts.append((int(cx + r * math.cos(angle)), int(cy + r * math.sin(angle))))
+    cv2.fillPoly(gray, [np.array(pts, dtype=np.int32)], 40)
+    img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    return img, {"center": (cx, cy), "radius": hole_radius}
+
+
+def test_scalloped_hole_boundary_is_still_detected_after_smoothing():
+    # A genuinely round hole with small-amplitude boundary scalloping must
+    # still be detected as a hole -- this is exactly the failure mode
+    # `_smooth_contour_for_shape_metrics` was added to fix.
+    img, gt = _make_scalloped_hole_part(scallop_amplitude_px=8, n_scallops=14, hole_radius=70)
+    part, circles, candidates = _detect(img)
+    assert len(circles) == 1
+    c = circles[0]
+    assert geometry.euclidean_distance((c.cx, c.cy), gt["center"]) <= DIAMETER_TOLERANCE_PX * 2
+    assert abs(c.r - gt["radius"]) <= DIAMETER_TOLERANCE_PX * 3
+
+
+def test_genuinely_non_circular_shape_still_rejected_after_smoothing():
+    # A real star/gear shape (large-amplitude, coarse scalloping -- a
+    # genuinely different shape, not fine boundary noise) must still fail —
+    # smoothing must not make every jagged blob pass.
+    img, gt = _make_scalloped_hole_part(scallop_amplitude_px=45, n_scallops=6, hole_radius=60)
+    part, circles, candidates = _detect(img)
+    assert len(circles) == 0
 
 
 def test_zero_holes_when_none_present():
@@ -445,3 +493,94 @@ def test_false_hough_circles_on_busy_flange_do_not_inflate_count():
 
     part, circles, candidates = _detect(img)
     assert len(circles) == len(gt["holes"])
+
+
+# --- fork/opening geometry: convex-hull defect analysis -----------------------------
+
+FORK_TOLERANCE_PX = 12  # pixelization/discretization tolerance for corner-precision checks
+
+
+def _build_fork(**kwargs):
+    img, gt = make_fork_bracket_part(**kwargs)
+    part = segmentation.build_detected_part(img)
+    assert part is not None
+    return img, gt, part
+
+
+def test_find_fork_tips_locates_both_inner_corners():
+    img, gt, part = _build_fork()
+    tips = geometry.find_fork_tips(part.contour, part.area_px2)
+    assert tips is not None
+
+    found = sorted([tips["tip_a"], tips["tip_b"]], key=lambda p: p[0])
+    expected = sorted([gt["tip_a_inner"], gt["tip_b_inner"]], key=lambda p: p[0])
+    for f, e in zip(found, expected):
+        assert geometry.euclidean_distance(f, e) <= FORK_TOLERANCE_PX
+
+
+def test_find_fork_tips_none_on_a_plain_circle():
+    # A plain filled circle has no dominant concavity at all -- must not
+    # fabricate "tips" from contour noise.
+    img, gt = make_circular_flange_part(n_bolt_holes=0, center_bore_r=0)
+    part = segmentation.build_detected_part(img)
+    assert part is not None
+    tips = geometry.find_fork_tips(part.contour, part.area_px2)
+    assert tips is None
+
+
+def test_fit_concave_arc_matches_inner_radius_despite_hub_bump():
+    img, gt, part = _build_fork()
+    tips = geometry.find_fork_tips(part.contour, part.area_px2)
+    assert tips is not None
+    arc = geometry.fit_concave_arc(part.contour, tips["start_idx"], tips["end_idx"])
+    assert arc is not None
+    assert abs(arc["radius_px"] - gt["inner_radius"]) <= FORK_TOLERANCE_PX * 2
+    assert arc["angular_span_deg"] >= geometry.MIN_ARC_ANGULAR_SPAN_DEG
+    # the hub bump is a real, deliberate outlier in the run -- a robust fit
+    # must not need every single point to agree
+    assert arc["inlier_fraction"] < 1.0
+
+
+def test_fit_concave_arc_none_without_a_real_concave_run():
+    # Too few points in the run (a tiny defect) must not produce a fitted
+    # "diameter" from noise.
+    tiny_contour = np.array([[[0, 0]], [[1, 0]], [[1, 1]], [[0, 1]]], dtype=np.int32)
+    assert geometry.fit_concave_arc(tiny_contour, 0, 2) is None
+
+
+def test_measure_tip_thickness_matches_arm_thickness():
+    img, gt, part = _build_fork()
+    tips = geometry.find_fork_tips(part.contour, part.area_px2)
+    arc = geometry.fit_concave_arc(part.contour, tips["start_idx"], tips["end_idx"])
+    assert arc is not None
+    ref_center = (arc["cx"], arc["cy"])
+    run = geometry._contour_run(part.contour, tips["start_idx"], tips["end_idx"])
+    inset = 15
+    sample_a = tuple(run[inset])
+    sample_b = tuple(run[-inset - 1])
+
+    t_a = geometry.measure_tip_thickness(part.mask, sample_a, ref_center)
+    t_b = geometry.measure_tip_thickness(part.mask, sample_b, ref_center)
+    assert t_a is not None and t_b is not None
+    assert abs(t_a["thickness_px"] - gt["arm_thickness_px"]) <= 5
+    assert abs(t_b["thickness_px"] - gt["arm_thickness_px"]) <= 5
+
+
+def test_measure_tip_thickness_none_for_degenerate_direction():
+    mask = np.full((50, 50), 255, dtype=np.uint8)
+    assert geometry.measure_tip_thickness(mask, (10, 10), (10, 10)) is None  # zero-length direction
+
+
+def test_fit_convex_arc_matches_outer_radius_and_exceeds_inner():
+    img, gt, part = _build_fork()
+    tips = geometry.find_fork_tips(part.contour, part.area_px2)
+    assert tips is not None
+    inner = geometry.fit_concave_arc(part.contour, tips["start_idx"], tips["end_idx"])
+    outer = geometry.fit_convex_arc(part.contour, tips["start_idx"], tips["end_idx"])
+    assert outer is not None
+    assert abs(outer["radius_px"] - gt["outer_radius"]) <= FORK_TOLERANCE_PX * 3
+    assert outer["angular_span_deg"] >= geometry.MIN_ARC_ANGULAR_SPAN_DEG
+    # sanity: outer must be a genuinely larger radius than the inner fit,
+    # not the same fit accidentally reused for both sides
+    assert inner is not None
+    assert outer["radius_px"] > inner["radius_px"]

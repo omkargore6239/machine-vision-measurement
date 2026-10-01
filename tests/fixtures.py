@@ -198,6 +198,148 @@ def make_c_shape_part(
     return img, {"center": center, "arc_radius": arc_radius, "arm_width": arm_width}
 
 
+def make_fork_bracket_part(
+    canvas_hw: tuple[int, int] = (900, 1400), hub_center: tuple[int, int] = (700, 550),
+    inner_radius: int = 180, outer_radius: int = 250,
+    start_angle: float = 200, end_angle: float = 340,
+    main_bore_r: int = 30, boss_hole_r: int = 10, boss_hole_offset: tuple[int, int] = (-35, 35),
+    bg_value: int = 25, fg_value: int = 195,
+) -> tuple[np.ndarray, dict]:
+    """A fork/rocker-arm-style bracket with known ground truth for every new
+    fork-geometry function: two arms of constant radial thickness
+    (`outer_radius - inner_radius`) sweeping from `start_angle` to
+    `end_angle` around `hub_center` (the arc's pivot point, NOT necessarily
+    filled material itself), each ending in a straight RADIAL tip face —
+    built by explicitly tracing outer arc -> radial tip face -> inner arc
+    -> matching radial tip face as one filled polygon, so the tip faces are
+    geometrically exact (unlike `make_c_shape_part`, whose `cv2.ellipse`
+    thickness rendering doesn't guarantee a clean straight cut at the
+    ends). A hub "boss" bump is added near the sweep's midpoint, centered
+    just inside the inner boundary and sized so it overlaps the arm band
+    without ever reaching `outer_radius` (so it can't distort the outer
+    convex hull the tip-finder relies on) while still intruding well past
+    `inner_radius` — a local, non-circular outlier in the inner-arc region,
+    like the real part's hub, so `fit_concave_arc`'s outlier-robustness is
+    actually exercised. The main bore and boss hole are cut into the hub
+    bump itself (real filled material), not the arc's abstract pivot
+    point, matching where the real part's holes actually sit."""
+    H, W = canvas_hw
+    gray = np.full((H, W), bg_value, dtype=np.uint8)
+    cx, cy = hub_center
+
+    n_arc_pts = 120
+    angles = np.linspace(math.radians(start_angle), math.radians(end_angle), n_arc_pts)
+    outer_pts = [(cx + outer_radius * math.cos(a), cy + outer_radius * math.sin(a)) for a in angles]
+    inner_pts = [(cx + inner_radius * math.cos(a), cy + inner_radius * math.sin(a)) for a in reversed(angles)]
+    poly = np.array(outer_pts + inner_pts, dtype=np.int32)
+    cv2.fillPoly(gray, [poly], fg_value)
+
+    mid_angle = math.radians((start_angle + end_angle) / 2)
+    hub_dist = inner_radius - 20  # just inside the inner boundary
+    hub_r = 70                    # reach: [hub_dist - hub_r, hub_dist + hub_r] = [90, 230] -- overlaps
+                                   # the arm band (180-250) without ever reaching outer_radius=250,
+                                   # and big enough relative to main_bore_r/boss_hole_r that both
+                                   # holes fit inside it without touching each other or its edge
+    hub_center_xy = (int(cx + hub_dist * math.cos(mid_angle)), int(cy + hub_dist * math.sin(mid_angle)))
+    cv2.circle(gray, hub_center_xy, hub_r, fg_value, -1)
+
+    cv2.circle(gray, hub_center_xy, main_bore_r, bg_value, -1)
+    boss_center = (hub_center_xy[0] + boss_hole_offset[0], hub_center_xy[1] + boss_hole_offset[1])
+    cv2.circle(gray, boss_center, boss_hole_r, bg_value, -1)
+
+    img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    tip_a_outer, tip_b_outer = outer_pts[0], outer_pts[-1]
+    tip_a_inner, tip_b_inner = inner_pts[-1], inner_pts[0]
+    tip_gap_outer_px = math.hypot(tip_a_outer[0] - tip_b_outer[0], tip_a_outer[1] - tip_b_outer[1])
+
+    return img, {
+        "hub_center": hub_center, "inner_radius": inner_radius, "outer_radius": outer_radius,
+        "arm_thickness_px": outer_radius - inner_radius,
+        "tip_a_outer": tip_a_outer, "tip_b_outer": tip_b_outer,
+        "tip_a_inner": tip_a_inner, "tip_b_inner": tip_b_inner,
+        "tip_gap_outer_px": tip_gap_outer_px,
+        "main_bore": (hub_center_xy[0], hub_center_xy[1], main_bore_r),
+        "boss_hole": (boss_center[0], boss_center[1], boss_hole_r),
+    }
+
+
+def make_shifter_fork_part(
+    inner_opening_px: float = 200.0,
+    straight_side_len_px: float = 60.0,
+    prong_wall_px: float = 25.0,
+    boss_straight_height_px: float = 35.0,
+    bore_radius_px: float = 18.0,
+    bore_transverse_offset_px: float = -35.0,
+    bg_value: int = 225, fg_value: int = 40,
+    margin: int = 80,
+) -> tuple[np.ndarray, dict]:
+    """A two-pronged shifter-fork silhouette: two straight parallel inner
+    edges meeting a semicircular slot bottom (radius = inner_opening/2, as
+    in the real recipes where "Fork Half Opening" nominal equals exactly
+    half of "Inner Fork Opening"), straight prong outer walls, a
+    semicircular outer dome directly above (radius = outer half-width, so
+    it meets the straight walls tangentially -- the dome apex is this
+    fixture's `top_point`, i.e. `tip_to_top` == `tip_to_outer_apex` here;
+    a real part's extra boss material above the dome is not modeled), and
+    an off-axis bore drilled into the boss above the slot.
+
+    Backlit-silhouette polarity, per the real recipe's brief: part dark
+    (`fg_value`), background bright (`bg_value`), bore bright (same as
+    background -- a real hole, not a coincidence of the fill values)."""
+    half_opening = inner_opening_px / 2.0
+    arc_radius = half_opening
+    outer_half_width = arc_radius + prong_wall_px
+    shoulder_y = arc_radius + boss_straight_height_px  # part-frame y where the dome starts
+    apex_y = shoulder_y + outer_half_width              # dome apex = top_point
+
+    n_arc = 60
+    left_outer_bottom = (-outer_half_width, -straight_side_len_px)
+    left_outer_top = (-outer_half_width, shoulder_y)
+    dome_pts = [(outer_half_width * math.cos(t), shoulder_y + outer_half_width * math.sin(t))
+                for t in np.linspace(math.pi, 0.0, n_arc)]
+    right_outer_bottom = (outer_half_width, -straight_side_len_px)
+    right_inner_bottom = (arc_radius, -straight_side_len_px)
+    slot_pts = [(arc_radius * math.cos(t), arc_radius * math.sin(t))
+                for t in np.linspace(0.0, math.pi, n_arc)]
+    left_inner_bottom = (-arc_radius, -straight_side_len_px)
+
+    part_pts = [left_outer_bottom, left_outer_top] + dome_pts + \
+               [right_outer_bottom, right_inner_bottom] + slot_pts + [left_inner_bottom]
+
+    def to_image(pt):
+        return (margin + outer_half_width + pt[0], margin + apex_y - pt[1])
+
+    img_pts = np.array([to_image(p) for p in part_pts], dtype=np.int32)
+
+    W = int(round(2 * margin + 2 * outer_half_width))
+    H = int(round(2 * margin + apex_y + straight_side_len_px))
+    gray = np.full((H, W), bg_value, dtype=np.uint8)
+    cv2.fillPoly(gray, [img_pts], fg_value)
+
+    bore_y_pf = arc_radius + boss_straight_height_px * 0.5
+    bore_cx, bore_cy = to_image((bore_transverse_offset_px, bore_y_pf))
+    if bore_radius_px > 0:
+        cv2.circle(gray, (int(round(bore_cx)), int(round(bore_cy))), int(round(bore_radius_px)), bg_value, -1)
+
+    img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    tip_point = to_image((0.0, arc_radius))
+    top_point = to_image((0.0, apex_y))
+
+    return img, {
+        "inner_opening_px": inner_opening_px,
+        "inner_arc_radius_px": arc_radius,
+        "outer_arc_radius_px": outer_half_width,
+        "outer_width_px": 2 * outer_half_width,
+        "tip_point": tip_point,
+        "top_point": top_point,
+        "bore_center": (bore_cx, bore_cy),
+        "bore_radius_px": bore_radius_px,
+        "axis_direction": (0.0, -1.0),  # "away from tip" points up the image
+    }
+
+
 def make_jagged_noise_blob(
     canvas_hw: tuple[int, int] = (500, 500), center: tuple[int, int] = (250, 250),
     base_radius: int = 120, spike_count: int = 40, spike_variation: int = 90,

@@ -37,6 +37,102 @@ CHARACTERISTIC_HOLE_POSITION = "hole_position"
 CHARACTERISTIC_EDGE_DISTANCE = "edge_distance"
 CHARACTERISTIC_RADIUS = "radius"
 CHARACTERISTIC_ANGLE = "angle"
+CHARACTERISTIC_INNER_ARC_DIAMETER = "inner_arc_diameter"
+CHARACTERISTIC_FORK_TIP_GAP = "fork_tip_gap"
+CHARACTERISTIC_ARM_LENGTH = "arm_length"
+CHARACTERISTIC_TIP_THICKNESS = "tip_thickness"
+CHARACTERISTIC_THICKNESS = "thickness"  # depth-axis material thickness — see ParameterResult docstring
+
+# Result of checking one named inspection characteristic (e.g. from
+# `vision.inspection_spec`) against a real measurement. Distinct from
+# `ToleranceResult` (which only knows "measured vs nominal/tolerance" for an
+# already-existing `MeasurementRecord`) — this also carries WHY a value
+# wasn't available at all, and a `debug` dict with every intermediate value
+# used to compute it, since these parameters can come from non-trivial
+# geometry (e.g. a RANSAC circle fit) rather than a plain lookup.
+#
+# Seven states, not four — MEASURED does NOT imply PASS: a real value can
+# exist with no approved tolerance to judge it against (NOT SPECIFIED), or
+# with two conflicting candidate specs that must never be silently resolved
+# (SPECIFICATION CONFLICT).
+PARAM_STATUS_MEASURED = "MEASURED"
+PARAM_STATUS_PASS = "PASS"
+PARAM_STATUS_FAIL = "FAIL"
+PARAM_STATUS_INCOMPLETE = "INCOMPLETE"              # tolerance configured, but no reliable measurement
+PARAM_STATUS_NOT_DETECTED = "NOT DETECTED"          # the underlying feature/geometry wasn't found at all
+PARAM_STATUS_NOT_SPECIFIED = "NOT SPECIFIED"        # measured, but no approved tolerance exists
+PARAM_STATUS_SPEC_CONFLICT = "SPECIFICATION CONFLICT"  # two candidate specs disagree — never auto-resolved
+
+
+@dataclass(frozen=True)
+class ToleranceDefinition:
+    """A real tolerance model — bilateral (±), one-sided (+x/-0 or +0/-x), or
+    entirely absent. `plus_mm`/`minus_mm` are both >= 0 magnitudes (not
+    signed offsets); `kind == "none"` is a distinct state from "a very tight
+    tolerance", not a zero-width one — it means no approved tolerance exists
+    at all, so `.limits()` returns `(None, None)` and nothing may be judged
+    PASS/FAIL against it."""
+
+    kind: str  # "bilateral" | "positive_only" | "negative_only" | "none"
+    plus_mm: float = 0.0
+    minus_mm: float = 0.0
+
+    def limits(self, nominal_mm: float) -> tuple[Optional[float], Optional[float]]:
+        if self.kind == "none":
+            return None, None
+        return nominal_mm - self.minus_mm, nominal_mm + self.plus_mm
+
+    def display(self) -> str:
+        if self.kind == "none":
+            return "NOT SPECIFIED"
+        if self.kind == "bilateral":
+            return f"±{self.plus_mm:g} mm"
+        if self.kind == "positive_only":
+            return f"+{self.plus_mm:g}/-0 mm"
+        if self.kind == "negative_only":
+            return f"+0/-{self.minus_mm:g} mm"
+        return "?"
+
+    @property
+    def has_tolerance(self) -> bool:
+        return self.kind != "none"
+
+
+def bilateral(tolerance_mm: float) -> ToleranceDefinition:
+    return ToleranceDefinition("bilateral", plus_mm=tolerance_mm, minus_mm=tolerance_mm)
+
+
+def positive_only(plus_mm: float) -> ToleranceDefinition:
+    return ToleranceDefinition("positive_only", plus_mm=plus_mm, minus_mm=0.0)
+
+
+def negative_only(minus_mm: float) -> ToleranceDefinition:
+    return ToleranceDefinition("negative_only", plus_mm=0.0, minus_mm=minus_mm)
+
+
+def not_specified() -> ToleranceDefinition:
+    return ToleranceDefinition("none")
+
+
+@dataclass
+class ParameterResult:
+    parameter_id: str
+    name: str
+    characteristic_type: str
+    value_kind: str  # "diameter" | "radius" | "linear" -- controls Ø vs R display
+    nominal_mm: Optional[float]
+    tolerance_display: str  # e.g. "±0.30 mm", "+0.30/-0 mm", "NOT SPECIFIED"
+    lower_limit_mm: Optional[float]
+    upper_limit_mm: Optional[float]
+    measured_mm: Optional[float]
+    unit: str
+    deviation_mm: Optional[float]
+    status: str  # PARAM_STATUS_*
+    confidence: str  # CONFIDENCE_* or "N/A"
+    method: str
+    reason: str = ""  # populated whenever status is INCOMPLETE, NOT DETECTED, or NOT SPECIFIED
+    conflict_note: str = ""  # populated only when status == SPECIFICATION CONFLICT
+    debug: dict = field(default_factory=dict)
 
 
 @dataclass

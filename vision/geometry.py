@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from vision.types import (
-    CircleFeature, HoleCandidate, CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, CONFIDENCE_LOW,
+    CircleFeature, DetectedPart, HoleCandidate, CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, CONFIDENCE_LOW,
 )
 
 # --- hole acceptance gates ---------------------------------------------------------
@@ -278,6 +278,34 @@ def _confidence_score(circularity: float, solidity: float, aspect_ratio: float,
     return min(1.0, base + bonus)
 
 
+CONTOUR_SMOOTHING_EPSILON_FRACTION = 0.01  # same scale as polygon_approx's default,
+                                             # already used elsewhere in this module
+
+
+def _smooth_contour_for_shape_metrics(contour: np.ndarray, epsilon_fraction: float = CONTOUR_SMOOTHING_EPSILON_FRACTION) -> np.ndarray:
+    """Removes pixel-level boundary noise — a "scalloped"/jagged contour
+    from adaptive-threshold quantization or fine surface texture right at a
+    hole's rim (confirmed on a real photo: a genuine, high-solidity [0.96]
+    machined bore measured circularity 0.63-0.68 purely from this kind of
+    boundary jaggedness) — before circularity/solidity/aspect-ratio are
+    computed, so those reflect the true underlying shape rather than a
+    sub-pixel artifact. Verified empirically not to matter for a shape
+    that's genuinely NOT round: a real elongated/irregular contour's
+    circularity stays low after this same smoothing, since the gate is
+    about the shape's true form, not its edge noise. Area changes by only
+    a few percent — this is not a size measurement change, only a shape
+    one. Only used for shape metrics; `_local_contrast_and_uniformity` /
+    `_boundary_edge_strength` still sample the ORIGINAL contour, and the
+    original (unsmoothed) contour is what's stored on `HoleCandidate` for
+    Debug Mode, so nothing about what's shown or sampled at pixel level
+    changes — only how "is this circular enough" is judged."""
+    perimeter = cv2.arcLength(contour, True)
+    if perimeter <= 0:
+        return contour
+    smoothed = cv2.approxPolyDP(contour, epsilon_fraction * perimeter, True)
+    return smoothed if len(smoothed) >= 3 else contour
+
+
 def evaluate_hole_candidates(
     gray: np.ndarray,
     outer_mask: np.ndarray,
@@ -310,24 +338,30 @@ def evaluate_hole_candidates(
     results: list[HoleCandidate] = []
 
     for c in hole_contours:
-        area, perimeter = area_perimeter(c)
+        # Shape metrics (circularity/solidity/aspect/equiv-diameter/centroid)
+        # are computed from a lightly smoothed copy of the contour — see
+        # `_smooth_contour_for_shape_metrics`'s docstring for why. Interior
+        # sampling, edge-strength, and everything stored/shown downstream
+        # still use the original, unsmoothed `c`.
+        c_shape = _smooth_contour_for_shape_metrics(c)
+        area, perimeter = area_perimeter(c_shape)
         if perimeter <= 0 or area <= 0:
             continue
         circularity = 4 * math.pi * area / (perimeter ** 2)
-        solidity = _solidity(c, area)
+        solidity = _solidity(c_shape, area)
         equiv_diameter = 2.0 * math.sqrt(area / math.pi)
 
-        ellipse = _fit_ellipse_safe(c)
+        ellipse = _fit_ellipse_safe(c_shape)
         if ellipse is not None:
             ecx, ecy, major, minor, angle = ellipse
             aspect_ratio = major / minor
         else:
-            (ecx, ecy), r = cv2.minEnclosingCircle(c)
+            (ecx, ecy), r = cv2.minEnclosingCircle(c_shape)
             major = minor = 2.0 * r
             angle = 0.0
             aspect_ratio = 1.0
 
-        M = cv2.moments(c)
+        M = cv2.moments(c_shape)
         if M["m00"] > 0:
             cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
         else:
@@ -623,3 +657,310 @@ def estimate_angles(contour: np.ndarray, epsilon_ratio: float = 0.02) -> list[di
         results.append(entry)
 
     return results
+
+
+# --- fork/opening geometry: convex-hull defect analysis ----------------------------
+#
+# For a fork/C-shaped part (two arms sweeping into a wide opening, like the
+# rocker-arm-style bracket this was built against), the entire concave
+# inner-arc + hub region is a single deep "defect" relative to the convex
+# hull's closing chord between the two outer tip corners. This is what makes
+# convexity-defect analysis a reliable, ROTATION-INVARIANT way to find the
+# tip corners without assuming any particular part orientation in the photo.
+
+MIN_DEFECT_DEPTH_FRACTION = 0.08   # the largest concavity depth must clear this
+                                    # fraction of sqrt(part area) to count as a real
+                                    # "opening" rather than ordinary contour noise
+MIN_DEFECT_DOMINANCE_RATIO = 1.8   # the largest defect must be at least this many
+                                    # times deeper than the second-largest, or which
+                                    # concavity is "the" fork opening is ambiguous
+MIN_ARC_INLIER_FRACTION = 0.55     # fraction of the concave run that must agree with
+                                    # a single circle before trusting an inner-arc fit
+MIN_ARC_ANGULAR_SPAN_DEG = 50.0    # a fit covering less than this isn't a meaningful
+                                    # "arc diameter", even if the points agree well
+ARC_INLIER_TOLERANCE_FRACTION = 0.06
+
+
+def find_fork_tips(contour: np.ndarray, part_area_px2: float) -> dict | None:
+    """Finds the two corners bounding a fork/C-shape's main opening — the
+    points where each arm's tip-face meets its inner edge (confirmed
+    empirically: the hull's dominant defect starts/ends where the boundary
+    turns concave, which is the INNER tip corner, not the outer one — the
+    short tip-face run itself stays on the hull all the way out to the
+    outer corner). These inner corners are exactly the two points that
+    define the fork's clear opening/gap. Returns None — never a guess —
+    unless one convexity defect is both deep enough (relative to the
+    part's own scale) and clearly dominant over every other concavity; a
+    shape that isn't confidently fork-like from this contour should never
+    have its "tips" picked from an ambiguous second-largest defect."""
+    c = contour.reshape(-1, 1, 2).astype(np.int32)
+    if len(c) < 4:
+        return None
+    hull_idx = cv2.convexHull(c, returnPoints=False)
+    if hull_idx is None or len(hull_idx) < 3:
+        return None
+    try:
+        defects = cv2.convexityDefects(c, hull_idx)
+    except cv2.error:
+        return None
+    if defects is None or len(defects) == 0:
+        return None
+    defects = defects.reshape(-1, 4)  # OpenCV returns (N,1,4) or (N,4) depending on build
+
+    part_scale = math.sqrt(part_area_px2) if part_area_px2 > 0 else 0.0
+    min_depth_px = MIN_DEFECT_DEPTH_FRACTION * part_scale
+
+    depths = defects[:, 3] / 256.0
+    order = np.argsort(depths)[::-1]
+    largest_depth = float(depths[order[0]])
+    second_depth = float(depths[order[1]]) if len(order) > 1 else 0.0
+
+    if largest_depth < min_depth_px:
+        return None
+    if second_depth > 0 and largest_depth < MIN_DEFECT_DOMINANCE_RATIO * second_depth:
+        return None
+
+    start_idx, end_idx, far_idx, _ = [int(v) for v in defects[order[0]]]
+    tip_a = c[start_idx][0]
+    tip_b = c[end_idx][0]
+    far_pt = c[far_idx][0]
+    return {
+        "tip_a": (float(tip_a[0]), float(tip_a[1])),
+        "tip_b": (float(tip_b[0]), float(tip_b[1])),
+        "far_point": (float(far_pt[0]), float(far_pt[1])),
+        "depth_px": largest_depth,
+        "start_idx": start_idx, "end_idx": end_idx, "far_idx": far_idx,
+    }
+
+
+def estimate_part_orientation(
+    part: DetectedPart, circles: list[CircleFeature], tips: dict | None
+) -> dict:
+    """Estimates which way the part is rotated in the photo, for reporting
+    and debug visualization only — no measurement in this pipeline depends
+    on this (diameters/radii come from fitted circles, distances from
+    Euclidean geometry, and Overall Fork Width/Height from `part.rotated_rect`,
+    all already rotation-invariant on their own; see `measurement.py`).
+
+    `part.rotated_rect`'s angle alone is ambiguous: a rectangle looks
+    identical rotated 180 degrees, and the fit doesn't say which long edge
+    is "up". That's resolved here using the vector from the fork-tips'
+    midpoint to the main hole's center — both real, already-detected points,
+    not a new detection — which gives a full 0-360 degree direction.
+
+    Returns a dict, never a guess:
+      - angle_deg: direction (0-360, image coordinates, clockwise from +x)
+        from the fork-tip opening toward the main hole, or None if it can't
+        be determined confidently.
+      - rect_angle_deg: the raw `cv2.minAreaRect` angle (-90, 90), always
+        present (it needs no other feature to compute).
+      - confidence: "HIGH" when both fork tips and a main hole were found,
+        "LOW" otherwise.
+      - reason: set when confidence is "LOW", naming what's missing.
+      - reference_points: the real points used, for debug visualization.
+    """
+    _cx, _cy, _rw, _rh, rect_angle = part.rotated_rect
+
+    main_hole = next((c for c in circles if c.feature_type == "bore"), None) or (
+        max(circles, key=lambda c: c.r) if circles else None
+    )
+
+    if tips is None or main_hole is None:
+        missing = []
+        if tips is None:
+            missing.append("fork tip corners")
+        if main_hole is None:
+            missing.append("a main hole/bore")
+        return {
+            "angle_deg": None,
+            "rect_angle_deg": rect_angle,
+            "confidence": "LOW",
+            "reason": (
+                "Orientation ambiguous — inspection not evaluated "
+                f"(missing: {', '.join(missing)})."
+            ),
+            "reference_points": {},
+        }
+
+    tip_a, tip_b = tips["tip_a"], tips["tip_b"]
+    mid = ((tip_a[0] + tip_b[0]) / 2.0, (tip_a[1] + tip_b[1]) / 2.0)
+    angle_deg = math.degrees(math.atan2(main_hole.cy - mid[1], main_hole.cx - mid[0])) % 360.0
+
+    return {
+        "angle_deg": angle_deg,
+        "rect_angle_deg": rect_angle,
+        "confidence": "HIGH",
+        "reason": "",
+        "reference_points": {
+            "fork_tip_midpoint": mid,
+            "main_hole_center": (main_hole.cx, main_hole.cy),
+        },
+    }
+
+
+def _contour_run(contour: np.ndarray, start_idx: int, end_idx: int) -> np.ndarray:
+    """Contour points from `start_idx` to `end_idx` walking forward, wrapping
+    past the array end if needed (the concave run between two convexity-
+    defect endpoints, in contour order)."""
+    n = len(contour)
+    idxs = list(range(start_idx, end_idx + 1)) if end_idx >= start_idx else (
+        list(range(start_idx, n)) + list(range(0, end_idx + 1))
+    )
+    return contour[idxs].reshape(-1, 2).astype(np.float64)
+
+
+def _circle_from_3_points(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> tuple[float, float, float] | None:
+    ax, ay = p1
+    bx, by = p2
+    cx0, cy0 = p3
+    d = 2 * (ax * (by - cy0) + bx * (cy0 - ay) + cx0 * (ay - by))
+    if abs(d) < 1e-9:
+        return None
+    ux = ((ax ** 2 + ay ** 2) * (by - cy0) + (bx ** 2 + by ** 2) * (cy0 - ay)
+          + (cx0 ** 2 + cy0 ** 2) * (ay - by)) / d
+    uy = ((ax ** 2 + ay ** 2) * (cx0 - bx) + (bx ** 2 + by ** 2) * (ax - cx0)
+          + (cx0 ** 2 + cy0 ** 2) * (bx - ax)) / d
+    r = math.hypot(ax - ux, ay - uy)
+    return ux, uy, r
+
+
+def _angular_span_deg(angles_deg: np.ndarray) -> float:
+    """Largest contiguous angular coverage of a set of points on a circle —
+    the complement of the largest gap between them, so it's correct even
+    when the points wrap past +/-180 degrees (unlike a plain max-min)."""
+    a = np.sort(np.mod(angles_deg, 360.0))
+    if len(a) < 2:
+        return 0.0
+    gaps = np.diff(np.concatenate([a, [a[0] + 360.0]]))
+    return 360.0 - float(np.max(gaps))
+
+
+def _ransac_circle_fit(pts: np.ndarray, seed: int = 7) -> dict | None:
+    """Robust circle fit shared by `fit_concave_arc` and `fit_convex_arc`.
+    Samples 3-point candidate circles (RANSAC-style), scores each by how
+    many of the point set's members lie within a tolerance band of it, and
+    keeps the best — outliers (a hub bump, a tip-face segment) naturally
+    fall out rather than dragging a plain least-squares fit off-target.
+    Returns None unless enough points agree with a single circle AND that
+    circle covers a real angular span — never a radius guessed from a loose
+    or partial fit."""
+    n = len(pts)
+    if n < 12:
+        return None
+
+    # Fixed per-run tolerance (NOT scaled by each candidate's own radius —
+    # a degenerate near-collinear 3-point sample yields a huge radius, and
+    # scaling tolerance by THAT radius would make the tolerance huge too,
+    # spuriously accepting almost every point as an "inlier" of a fake
+    # near-straight-line fit). Both derived from the point set's own
+    # spatial extent instead.
+    run_extent = float(np.max(np.hypot(pts[:, 0] - pts[:, 0].mean(), pts[:, 1] - pts[:, 1].mean()))) * 2 or 1.0
+    tol = max(2.0, ARC_INLIER_TOLERANCE_FRACTION * run_extent)
+    max_sane_radius = 4.0 * run_extent  # excludes near-collinear degenerate samples outright
+
+    rng = np.random.RandomState(seed)
+    best_count = -1
+    best_mask = None
+    for _ in range(min(80, n * 2)):
+        i, j, k = rng.choice(n, size=3, replace=False)
+        circle = _circle_from_3_points(pts[i], pts[j], pts[k])
+        if circle is None:
+            continue
+        cx, cy, r = circle
+        if r <= 0 or not math.isfinite(r) or r > max_sane_radius:
+            continue
+        dists = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
+        inliers = np.abs(dists - r) <= tol
+        count = int(np.sum(inliers))
+        if count > best_count:
+            best_count, best_mask = count, inliers
+
+    if best_mask is None or best_count / n < MIN_ARC_INLIER_FRACTION:
+        return None
+
+    cx, cy, r, rms = _fit_circle_least_squares(pts[best_mask])
+    if r <= 0 or not math.isfinite(r) or rms > 0.12 * r:
+        return None
+
+    inlier_pts = pts[best_mask]
+    angles = np.degrees(np.arctan2(inlier_pts[:, 1] - cy, inlier_pts[:, 0] - cx))
+    angular_span = _angular_span_deg(angles)
+    if angular_span < MIN_ARC_ANGULAR_SPAN_DEG:
+        return None
+
+    return {
+        "cx": float(cx), "cy": float(cy), "radius_px": float(r),
+        "inlier_fraction": float(best_count) / n, "angular_span_deg": float(angular_span),
+        "rms_px": float(rms), "n_run_points": n,
+    }
+
+
+def fit_concave_arc(contour: np.ndarray, start_idx: int, end_idx: int, seed: int = 7) -> dict | None:
+    """Robust circle fit to the concave run between two fork-tip corners
+    (the inner-arc side, e.g. Overall Arc / Inner Arc Diameter). That run
+    mixes two genuine arc segments with a hub bump in the middle — not one
+    consistent circle — which is exactly what `_ransac_circle_fit` is
+    built to handle."""
+    return _ransac_circle_fit(_contour_run(contour, start_idx, end_idx), seed)
+
+
+def fit_convex_arc(contour: np.ndarray, start_idx: int, end_idx: int, seed: int = 11) -> dict | None:
+    """Robust circle fit to the OUTER (convex) side of the same fork
+    contour `fit_concave_arc` fits the inner side of — the complementary
+    run from `end_idx` back around to `start_idx` the long way, through the
+    true outer arc. Same RANSAC core, same reliability gates; a different
+    `seed` from `fit_concave_arc` only to avoid the two fits ever sampling
+    an identical candidate sequence by coincidence."""
+    return _ransac_circle_fit(_contour_run(contour, end_idx, start_idx), seed)
+
+
+def measure_tip_thickness(mask: np.ndarray, tip_point: tuple[float, float],
+                           reference_center: tuple[float, float], nudge_px: float = 5.0,
+                           max_search_px: float = 300.0) -> dict | None:
+    """Real material cross-section thickness at a fork tip corner (from
+    `find_fork_tips` — the tip corner nearest the part's own concave
+    opening). The corner point itself sits exactly on the boundary between
+    two arm edges, which makes the "which way is outward" direction too
+    sensitive to sub-pixel angular error to start a ray from directly — so
+    this first nudges a few pixels INWARD (toward `reference_center`,
+    ideally the fitted arc's own center from `fit_concave_arc`, which
+    shares its geometry) to land solidly inside the material, then
+    ray-marches `mask` OUTWARD from there, counting material pixels until
+    it exits into background — a direct measurement of how much material
+    is actually there, not an appearance guess. Returns None if the
+    direction is degenerate or the nudged start point isn't in material at
+    all (nothing invented)."""
+    tx, ty = tip_point
+    hx, hy = reference_center
+    dx, dy = tx - hx, ty - hy
+    norm = math.hypot(dx, dy)
+    if norm < 1e-6:
+        return None
+    dx, dy = dx / norm, dy / norm
+
+    H, W = mask.shape[:2]
+    # `tip_point` sits on the INNER-arc side of the boundary (nearest
+    # `reference_center`), so material is on the OUTWARD side -- nudge that
+    # way first (not toward the center) to reliably land inside it before
+    # marching further outward to the true outer edge.
+    start_x, start_y = tx + dx * nudge_px, ty + dy * nudge_px
+    xi0, yi0 = int(round(start_x)), int(round(start_y))
+    if not (0 <= xi0 < W and 0 <= yi0 < H) or mask[yi0, xi0] == 0:
+        return None
+
+    steps = 0
+    x, y = start_x, start_y
+    for _ in range(int(max_search_px)):
+        x += dx
+        y += dy
+        xi, yi = int(round(x)), int(round(y))
+        if not (0 <= xi < W and 0 <= yi < H) or mask[yi, xi] == 0:
+            break
+        steps += 1
+
+    if steps < 2:
+        return None
+    return {
+        "tip_point_px": (float(tx), float(ty)), "direction": (float(dx), float(dy)),
+        "thickness_px": float(steps) + nudge_px,
+    }
