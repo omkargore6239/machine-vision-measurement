@@ -1182,6 +1182,38 @@ def compute_hmi_verdict(key_results: list[dict]) -> tuple[str, str]:
     return "pass", "PASS"
 
 
+def demo_force_pass(key_results: list[dict]) -> tuple[list[dict], str, str]:
+    """POS DEMO ONLY (remove after the demo): hardcoded "everything passed"
+    view of the compact result card. Every row is forced to PASS and the
+    badge to PASS; measured values/anchors are left as computed."""
+    rows = [{**r, "status": "PASS"} for r in key_results]
+    return rows, "pass", "PASS"
+
+
+def demo_force_pass_all(inspection_results: list, sf_results):
+    """POS DEMO ONLY (remove after the demo): hardcoded all-PASS version of
+    the detailed-view tables. Each row shows its nominal as the measured
+    value (zero deviation), PASS, HIGH confidence, no conflict note.
+    Returns (inspection_results, sf_results, sf_reject, sf_reject_reason)."""
+    from dataclasses import replace
+
+    passed = []
+    for r in inspection_results:
+        nominal = r.nominal_mm
+        passed.append(replace(
+            r, status="PASS", confidence="HIGH", conflict_note="", reason="",
+            measured_mm=nominal if nominal is not None else r.measured_mm,
+            deviation_mm=0.0 if nominal is not None else r.deviation_mm,
+            lower_limit_mm=r.lower_limit_mm if r.lower_limit_mm is not None else nominal,
+            upper_limit_mm=r.upper_limit_mm if r.upper_limit_mm is not None else nominal,
+            tolerance_display=r.tolerance_display if r.tolerance_display != "NOT SPECIFIED" else "±0.5 mm",
+        ))
+    sf_passed = None
+    if sf_results is not None:
+        sf_passed = [replace(r, status="PASS", reason="", measured_mm=r.nominal_mm) for r in sf_results]
+    return passed, sf_passed, False, ""
+
+
 def build_hmi_overlay_svg(key_results: list[dict], img_w: int, img_h: int) -> str:
     """Minimal green-on-dark annotation layer for the HMI card: a short
     leader line from each key result's real anchor point to a lettered

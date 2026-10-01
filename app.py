@@ -668,6 +668,24 @@ elif step == 2:
                 # Advanced / Detailed View's own "INSPECTION RESULT" hero).
                 hmi_verdict_key, hmi_verdict_label = inspection_view.compute_hmi_verdict(key_results)
 
+            # --- POS DEMO ONLY: remove this block after the demo ----------------
+            # The real verdict is always computed above; only when it is FAIL do we
+            # offer a button that swaps BOTH views to a hardcoded all-PASS result.
+            demo_key = f"pos_demo_pass_{uf.name}"
+            demo_on = st.session_state.get(demo_key, False)
+            if hmi_verdict_key == "fail" or demo_on:
+                if st.button("Back to real result" if demo_on else "Show PASS result (POS demo)",
+                             key=f"{demo_key}_btn"):
+                    st.session_state[demo_key] = not demo_on
+                    st.rerun()
+            if demo_on:
+                inspection_results, sf_results, sf_reject, sf_reject_reason = inspection_view.demo_force_pass_all(
+                    inspection_results, sf_results,
+                )
+                key_results = inspection_view.build_hmi_key_results(sf_results, sf_landmarks, inspection_results, part.bbox, decimals)
+                key_results, hmi_verdict_key, hmi_verdict_label = inspection_view.demo_force_pass(key_results)
+            # --- end POS DEMO ----------------------------------------------------
+
             advanced_view = st.checkbox(
                 "Advanced / Detailed View", key=f"advanced_view_{uf.name}", value=False,
                 help="Off: compact HMI-style summary. On: the full detailed dashboard (tabs, tables, tolerance "
