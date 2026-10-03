@@ -448,6 +448,69 @@ def build_svg_overlay(
             status_key, selected, box["cx"], box["cy"], reveal_delay, tooltip_html,
         ))
 
+    # --- vertical distance: each feature centre straight down to the part's
+    #     lowest point (image Y), drawn as a dashed line with a tick + label --
+    lowest_y = float(part.contour[:, 0, 1].max())
+    for c in circles:
+        label = c.label or f"Hole {c.circle_id}"
+        v_r = rec_by_feature.get(f"{label} Center to Lowest Point (vertical)")
+        if v_r is None or lowest_y - c.cy < c.r:
+            continue
+        v_label = "V " + _fmt_len(v_r.px_value, v_r.mm_value, decimals)
+        mid_y = (c.cy + c.r + lowest_y) / 2
+        box = {"cx": c.cx + _text_box_w(v_label) / 2 + 10, "cy": mid_y, "w": _text_box_w(v_label), "h": 20}
+        box["cx"] = min(max(box["cx"], box["w"] / 2 + 2), img_w - box["w"] / 2 - 2)
+        obstacles.append(box)
+        diagnostics.append({"id": f"{c.short_id} vertical", "kind": "vertical", "direction": "fixed", "score": 0.0, "box": dict(box)})
+        col = COLOR_INFO
+        parts.append(
+            f'<g data-layer="dimensions">'
+            f'<line x1="{c.cx}" y1="{c.cy}" x2="{c.cx}" y2="{lowest_y}" stroke="{col}" stroke-width="1.5" '
+            f'stroke-dasharray="6,4" marker-end="url(#arrowEnd-info)" />'
+            f'<line x1="{c.cx - 24}" y1="{lowest_y}" x2="{c.cx + 24}" y2="{lowest_y}" stroke="{col}" stroke-width="1.5" />'
+            f'<rect x="{box["cx"] - box["w"] / 2}" y="{box["cy"] - box["h"] / 2}" width="{box["w"]}" height="{box["h"]}" '
+            f'rx="3" fill="#FFFFFF" stroke="{col}" stroke-width="1" opacity="0.95" /></g>'
+            f'<g data-layer="values"><text x="{box["cx"]}" y="{box["cy"] + 4}" text-anchor="middle" fill="{col}" '
+            f'font-size="11" font-family="IBM Plex Mono, monospace" font-weight="700">{_esc(v_label)}</text></g>'
+        )
+
+    # --- perpendicular distance from each feature centre to the fork-tip base
+    #     line (the part's own frame), drawn as a solid line to its foot point --
+    tips = geometry.find_fork_tips(part.contour, part.area_px2)
+    if tips is not None:
+        ta = np.array(tips["tip_a"], float)
+        tb = np.array(tips["tip_b"], float)
+        base = tb - ta
+        base_len = float(np.hypot(*base))
+        if base_len > 1e-6:
+            unit = base / base_len
+            col = COLOR_WARN
+            for c in circles:
+                label = c.label or f"Hole {c.circle_id}"
+                p_r = rec_by_feature.get(f"{label} Center to Tip Line (perpendicular)")
+                if p_r is None:
+                    continue
+                t = float(np.dot(np.array([c.cx, c.cy]) - ta, unit))
+                fx, fy = ta + unit * t
+                p_label = "H " + _fmt_len(p_r.px_value, p_r.mm_value, decimals)
+                bw = _text_box_w(p_label)
+                lx, ly = (c.cx + fx) / 2 + bw / 2 + 8, (c.cy + fy) / 2
+                lx = min(max(lx, bw / 2 + 2), img_w - bw / 2 - 2)
+                obstacles.append({"cx": lx, "cy": ly, "w": bw, "h": 20})
+                diagnostics.append({"id": f"{c.short_id} to tip line", "kind": "perpendicular", "direction": "fixed",
+                                    "score": 0.0, "box": {"cx": lx, "cy": ly, "w": bw, "h": 20}})
+                parts.append(
+                    f'<g data-layer="dimensions">'
+                    f'<line x1="{ta[0]}" y1="{ta[1]}" x2="{tb[0]}" y2="{tb[1]}" stroke="{col}" stroke-width="1" '
+                    f'stroke-dasharray="3,4" opacity="0.7" />'
+                    f'<line x1="{c.cx}" y1="{c.cy}" x2="{fx}" y2="{fy}" stroke="{col}" stroke-width="2" />'
+                    f'<circle cx="{fx}" cy="{fy}" r="3.5" fill="{col}" />'
+                    f'<rect x="{lx - bw / 2}" y="{ly - 10}" width="{bw}" height="20" rx="3" fill="#FFFFFF" '
+                    f'stroke="{col}" stroke-width="1" opacity="0.95" /></g>'
+                    f'<g data-layer="values"><text x="{lx}" y="{ly + 4}" text-anchor="middle" fill="{col}" '
+                    f'font-size="11" font-family="IBM Plex Mono, monospace" font-weight="700">{_esc(p_label)}</text></g>'
+                )
+
     # --- reliable corner / inner-arc radii (real fitted geometry only) -----
     corner_radii = geometry.estimate_corner_radii(part.contour)
     reliable_corners = [c for c in corner_radii if c["reliable"]]
@@ -1297,18 +1360,19 @@ def build_hmi_result_html(
 <style>
   * {{ box-sizing: border-box; }}
   body {{ margin: 0; background: {HMI_BG}; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }}
-  .mv-hmi-panel {{ background: {HMI_BG}; border: 1px solid {HMI_BORDER}; border-radius: 10px; padding: 18px; color: {HMI_TEXT}; }}
-  .mv-hmi-header {{ font-size: 1.1rem; font-weight: 700; letter-spacing: 0.02em; margin-bottom: 14px; color: {HMI_TEXT}; }}
+  .mv-hmi-panel {{ background: linear-gradient(160deg, #0F172A 0%, {HMI_BG} 70%); border: 1px solid {HMI_BORDER}; border-radius: 20px; padding: 22px; color: {HMI_TEXT}; box-shadow: 0 20px 50px rgba(2,6,23,0.35); }}
+  .mv-hmi-header {{ font-size: 0.8rem; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase; margin-bottom: 16px; color: {HMI_TEXT_MUTED}; }}
   .mv-hmi-body {{ display: flex; gap: 20px; align-items: flex-start; }}
-  .mv-hmi-image-wrap {{ position: relative; flex: 1 1 58%; background: {HMI_SURFACE}; border-radius: 8px; overflow: hidden; border: 1px solid {HMI_BORDER}; }}
+  .mv-hmi-image-wrap {{ position: relative; flex: 1 1 58%; background: {HMI_SURFACE}; border-radius: 14px; overflow: hidden; border: 1px solid {HMI_BORDER}; }}
   .mv-hmi-image-wrap img {{ display: block; width: 100%; height: auto; }}
   .mv-hmi-side {{ flex: 1 1 42%; display: flex; flex-direction: column; gap: 10px; }}
   .mv-hmi-badge {{ display: flex; align-items: center; justify-content: center; gap: 10px;
-                    background: {badge_color}22; border: 1px solid {badge_color}; border-radius: 8px;
-                    padding: 14px; font-size: 1.4rem; font-weight: 800; color: {badge_color}; }}
+                    background: {badge_color}22; border: 1px solid {badge_color}; border-radius: 14px;
+                    padding: 18px; font-size: 1.6rem; font-weight: 800; letter-spacing: 0.06em; color: {badge_color};
+                    box-shadow: 0 0 28px {badge_color}44; }}
   .mv-hmi-badge-icon {{ font-size: 1.4rem; }}
   .mv-hmi-row {{ display: flex; align-items: center; gap: 10px; background: {HMI_SURFACE};
-                  border: 1px solid {HMI_BORDER}; border-radius: 8px; padding: 10px 12px; }}
+                  border: 1px solid {HMI_BORDER}; border-radius: 12px; padding: 12px 14px; }}
   .mv-hmi-row-letter {{ flex: 0 0 22px; height: 22px; line-height: 22px; text-align: center; border-radius: 50%;
                           background: {HMI_TEXT_MUTED}33; color: {HMI_TEXT}; font-weight: 700; font-size: 0.85rem; }}
   .mv-hmi-row-label {{ flex: 1 1 auto; color: {HMI_TEXT_MUTED}; font-size: 0.9rem; }}

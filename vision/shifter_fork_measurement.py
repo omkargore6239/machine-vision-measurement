@@ -168,7 +168,12 @@ _ANGLE_DISPATCH = {
     "bore_angle_deg": _deg_bore_angle,
 }
 
-KNOWN_FEATURES = set(_FEATURE_DISPATCH) | set(_ANGLE_DISPATCH)
+# Characteristics that exist on the drawing but are only visible from a side
+# view -- accepted as valid recipe keys, reported as "NEEDS SIDE VIEW".
+SIDE_VIEW_FEATURES = {"cross_hole_5h10", "pad_thickness", "tip_thickness_side"}
+STATUS_NEEDS_SIDE_VIEW = "NEEDS SIDE VIEW"
+
+KNOWN_FEATURES = set(_FEATURE_DISPATCH) | set(_ANGLE_DISPATCH) | SIDE_VIEW_FEATURES
 
 
 def _evaluate_attribute(attr: ShifterForkAttribute, landmarks: ShifterForkLandmarks,
@@ -177,7 +182,10 @@ def _evaluate_attribute(attr: ShifterForkAttribute, landmarks: ShifterForkLandma
     status = PARAM_STATUS_NOT_DETECTED
     reason = ""
 
-    if landmarks.reject_reason is not None:
+    if attr.needs_view:
+        status = STATUS_NEEDS_SIDE_VIEW
+        reason = f"Not visible from the top view -- needs a {attr.needs_view} camera or gauge."
+    elif landmarks.reject_reason is not None:
         reason = landmarks.reject_reason
     elif attr.feature in _ANGLE_DISPATCH:
         value = _ANGLE_DISPATCH[attr.feature](landmarks)

@@ -148,124 +148,43 @@ def compute_shifter_fork_aggregate(sf_reject: bool, sf_reject_reason: str) -> tu
 # Sidebar: grouped navigation (Inspection / Setup / Diagnostics / Reports)
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown('<div class="mv-nav-heading">Inspection</div>', unsafe_allow_html=True)
     if st.button("New Inspection", use_container_width=True, key="nav_new_inspection"):
         st.session_state["batch_results"] = {}
         st.session_state["tolerance_specs"] = {}
         st.session_state["selected_feature"] = {}
         go_to_step(1)
-    if st.button("Measure Part", use_container_width=True, key="nav_measure_part"):
-        go_to_step(2)
-    with st.expander("Inspection History", expanded=False):
+    with st.expander("History", expanded=False):
         if st.session_state["batch_results"]:
             for fname, data in st.session_state["batch_results"].items():
                 status_key, status_label = compute_aggregate_status(data.get("tolerance_results", []))
                 dot = {"pass": "🟢", "fail": "🔴", "incomplete": "🟠"}.get(status_key, "⚪")
-                st.caption(f"{dot} **{fname}** — {status_label} · {data.get('timestamp', '—')}")
+                st.caption(f"{dot} **{fname}** — {status_label}")
         else:
-            st.caption("No inspections yet this session.")
-
-    st.markdown('<div class="mv-nav-heading">Setup</div>', unsafe_allow_html=True)
-    if st.button("Calibration", use_container_width=True, key="nav_calibration"):
-        go_to_step(1)
+            st.caption("No inspections yet.")
+    st.divider()
     advanced_mode = st.checkbox(
         "Inspection Settings", value=False, key="advanced_mode",
         help="Full measurement table, tolerance configuration, and coordinate-origin choice.",
     )
-    st.markdown(
-        '<div class="mv-nav-item-disabled">Feature Configuration '
-        '<span style="float:right;">Coming soon</span></div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown('<div class="mv-nav-heading">Diagnostics</div>', unsafe_allow_html=True)
     debug_mode = st.checkbox(
         "Vision Debug", value=False, key="debug_mode",
-        help="Preprocessed image, main-part mask, and every hole candidate "
-             "(accepted/rejected, with the reason).",
-    )
-    with st.expander("System Status", expanded=False):
-        _sys_profile = get_active_profile()
-        st.caption(f"Calibration: {'ACTIVE — ' + _sys_profile.name if _sys_profile else 'NOT ACTIVE'}")
-        st.caption(f"Images measured this session: {len(st.session_state['batch_results'])}")
-        _statuses = [compute_aggregate_status(d.get("tolerance_results", []))[0]
-                     for d in st.session_state["batch_results"].values()]
-        st.caption(f"Pass: {_statuses.count('pass')}  ·  Fail: {_statuses.count('fail')}  ·  "
-                   f"Incomplete: {_statuses.count('incomplete')}")
-
-    st.markdown('<div class="mv-nav-heading">Reports</div>', unsafe_allow_html=True)
-    if st.button("Inspection Reports / Export", use_container_width=True, key="nav_export"):
-        go_to_step(3)
-
-    st.divider()
-    st.caption(
-        "A normal photograph has no inherent physical scale. Real-world mm measurements "
-        "require an explicit calibration. This app never assumes 1 pixel = 1 mm."
+        help="Preprocessed image, main-part mask, and every hole candidate.",
     )
 
 active_profile = get_active_profile()
 
-_title_col, _status_col = st.columns([3, 2])
-with _title_col:
-    st.title("Machine Vision Inspection")
-    st.caption("Dimensional Quality Inspection System")
-with _status_col:
-    _cal_line = (f'<span class="mv-status-dot pass"></span>Calibration: <b>ACTIVE</b> — {esc_html(active_profile.name)}'
-                 if active_profile else '<span class="mv-status-dot warn"></span>Calibration: <b>NOT ACTIVE</b>')
-    st.markdown(
-        f"""<div style="text-align:right; padding-top:10px;">
-            <div><span class="mv-status-dot pass"></span><b>SYSTEM READY</b></div>
-            <div class="mv-header-sub">{_cal_line}</div>
-            <div class="mv-header-sub">{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
-
-# ---------------------------------------------------------------------------
-# Toolbar — every button routes to a real action (no decorative controls)
-# ---------------------------------------------------------------------------
-with st.container(key="mv_toolbar"):
-    tb = st.columns(7)
-    with tb[0]:
-        if st.button("New Inspection", key="tb_new", use_container_width=True):
-            st.session_state["batch_results"] = {}
-            st.session_state["tolerance_specs"] = {}
-            st.session_state["selected_feature"] = {}
-            go_to_step(1)
-    with tb[1]:
-        if st.button("Load Image", key="tb_load", use_container_width=True):
-            go_to_step(2)
-    with tb[2]:
-        if st.button("Re-measure", key="tb_remeasure", use_container_width=True):
-            st.rerun()
-    with tb[3]:
-        if st.button("Calibration", key="tb_cal", use_container_width=True):
-            go_to_step(1)
-    with tb[4]:
-        if st.button("Debug", key="tb_debug", use_container_width=True):
-            st.session_state["debug_mode"] = not st.session_state.get("debug_mode", False)
-            st.rerun()
-    with tb[5]:
-        if st.button("Export Report", key="tb_export", use_container_width=True):
-            go_to_step(3)
-    with tb[6]:
-        st.markdown(
-            '<button onclick="window.print()" style="width:100%;padding:3px 10px;'
-            'font-size:0.8rem;border:1px solid #D9DEE7;border-radius:5px;background:#FFFFFF;'
-            'color:#17202A;cursor:pointer;font-family:Inter,sans-serif;margin-top:1px;">'
-            '\U0001F5A8 Print</button>',
-            unsafe_allow_html=True,
-        )
+st.title("Machine Vision Inspection")
 
 # ---------------------------------------------------------------------------
 # Step navigation bar
 # ---------------------------------------------------------------------------
 STEP_LABELS = ["① Calibrate", "② Measure Parts", "③ Export Results"]
-nav_cols = st.columns(3)
-for i, col in enumerate(nav_cols, start=1):
-    with col:
-        if st.button(STEP_LABELS[i - 1], key=f"nav_step_{i}", type=("primary" if i == st.session_state["wizard_step"] else "secondary"), use_container_width=True):
-            go_to_step(i)
+with st.container(key="mv_steps"):
+    nav_cols = st.columns(3)
+    for i, col in enumerate(nav_cols, start=1):
+        with col:
+            if st.button(STEP_LABELS[i - 1], key=f"nav_step_{i}", type=("primary" if i == st.session_state["wizard_step"] else "secondary"), use_container_width=True):
+                go_to_step(i)
 st.divider()
 
 step = st.session_state["wizard_step"]
@@ -275,10 +194,7 @@ step = st.session_state["wizard_step"]
 # ===========================================================================
 if step == 1:
     st.header("Step 1: Calibrate")
-    st.write(
-        "To show real-world millimetre measurements, the app needs to know your photo's scale. "
-        "**If you skip this step, you'll still get accurate pixel measurements — just no mm.**"
-    )
+    st.caption("Set the photo scale to get results in mm. Skip it for pixel values only.")
 
     if active_profile is not None:
         st.success(
@@ -474,7 +390,6 @@ elif step == 2:
         "Upload one or more part images",
         type=IMAGE_TYPES,
         accept_multiple_files=True,
-        help="For reliable measurement, use a fixed camera, controlled lighting and a plain, contrasting background.",
     )
 
     if advanced_mode:
@@ -485,9 +400,7 @@ elif step == 2:
         origin_choice = "Bounding box top-left"
         decimals = 2
 
-    if not uploaded_files:
-        st.info("Upload at least one image to begin measurement.")
-    else:
+    if uploaded_files:
         for idx, uf in enumerate(uploaded_files):
             st.divider()
 
@@ -653,6 +566,31 @@ elif step == 2:
             if not pipeline_ok:
                 continue
 
+            # --- Calibrate from the part's own detected round feature ---------
+            if circles:
+                ref_hole = max(circles, key=lambda c: c.r)
+                with st.expander("Calibrate from the detected hole", expanded=profile_for_image is None):
+                    st.caption(
+                        f"Largest detected hole is {2 * ref_hole.r:.0f} px across. If you know its real "
+                        "diameter, use it as the scale reference for this and later photos."
+                    )
+                    cal_c1, cal_c2 = st.columns([2, 1])
+                    with cal_c1:
+                        known_hole_mm = st.number_input(
+                            "Real hole diameter (mm)", min_value=0.01, value=14.0, format="%.3f",
+                            key=f"known_hole_mm_{uf.name}",
+                        )
+                    with cal_c2:
+                        st.write("")
+                        if st.button("Use as calibration", key=f"use_hole_cal_{uf.name}", use_container_width=True):
+                            new_profile = calibration.known_feature_calibrate(
+                                2 * ref_hole.r, known_hole_mm, display_img.shape[:2],
+                                name=f"Hole {known_hole_mm:g}mm",
+                            )
+                            calibration.save_profile(new_profile)
+                            st.session_state["active_profile_id"] = new_profile.profile_id
+                            st.rerun()
+
             # ===================================================================
             # Result screen — light industrial metrology dashboard layout
             # ===================================================================
@@ -784,6 +722,18 @@ elif step == 2:
                                     key=f"spec_tol_{uf.name}_{spec.parameter_id}", format="%.3f", label_visibility="collapsed",
                                 )
                             overrides_for_image[spec.parameter_id] = (new_nominal, new_tol)
+
+                # --- Hole centre -> lowest point of the part (straight vertical) ------
+                v_records = [r for r in records if r.feature.endswith(("Center to Lowest Point (vertical)",
+                                                                       "Center to Tip Line (perpendicular)"))]
+                if v_records:
+                    v_cols = st.columns(len(v_records))
+                    for col, r in zip(v_cols, v_records):
+                        col.metric(
+                            r.feature.replace(" Center to Lowest Point (vertical)", " centre → lowest point (vertical)")
+                                    .replace(" Center to Tip Line (perpendicular)", " centre → tip line (perpendicular)"),
+                            fmt_value(r.px_value, r.mm_value),
+                        )
 
                 # --- Shifter Fork Dimensional Inspection recipe (opt-in) -------------
                 if sf_results is not None:

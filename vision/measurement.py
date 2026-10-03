@@ -11,6 +11,7 @@ import itertools
 import math
 
 import cv2
+import numpy as np
 
 from vision import calibration, geometry
 from vision.inspection_spec import INSPECTION_SPEC
@@ -212,6 +213,31 @@ def build_measurement_records(
         edge_dist_px = geometry.distance_to_contour(part.contour, (c.cx, c.cy))
         records.append(_record(f"{prefix} to Nearest Edge", "Distances", edge_dist_px, profile, confidence=c.confidence))
 
+        # Straight vertical (image-Y) distance from this feature's centre down
+        # to the part's lowest contour point.
+        lowest_y = float(part.contour[:, 0, 1].max())
+        records.append(_record(
+            f"{prefix} Center to Lowest Point (vertical)", "Distances",
+            max(0.0, lowest_y - c.cy), profile, confidence=c.confidence,
+        ))
+
+    # Perpendicular distance from each feature centre to the line through the
+    # two fork tips (the part's own base line) -- the hole's height in the
+    # part's frame, independent of how the photo is rotated.
+    tips = geometry.find_fork_tips(part.contour, part.area_px2)
+    if tips is not None:
+        ta, tb = np.array(tips["tip_a"], float), np.array(tips["tip_b"], float)
+        base = tb - ta
+        base_len = float(np.hypot(*base))
+        if base_len > 1e-6:
+            for c in circles:
+                prefix = c.label or f"Hole {c.circle_id}"
+                perp = abs(base[0] * (c.cy - ta[1]) - base[1] * (c.cx - ta[0])) / base_len
+                records.append(_record(
+                    f"{prefix} Center to Tip Line (perpendicular)", "Distances", perp, profile,
+                    confidence=c.confidence,
+                ))
+
     for a, b in itertools.combinations(circles, 2):
         dist_px = geometry.euclidean_distance((a.cx, a.cy), (b.cx, b.cy))
         confidence = CONFIDENCE_HIGH if a.confidence == CONFIDENCE_HIGH and b.confidence == CONFIDENCE_HIGH else CONFIDENCE_MEDIUM
@@ -274,6 +300,31 @@ def apply_tolerances(records: list[MeasurementRecord],
 # here — see `vision.geometry` for the actual fork-geometry algorithms and
 # `vision.inspection_spec` for the parameter definitions/nominal values.
 
+def _median_tip_thickness(mask, run, ref_center, from_start: bool) -> dict | None:
+    """Radial arm thickness near one fork tip, as the median over several
+    points a little way along the arm. A single point too close to the tip
+    corner can lie on the flat end face of the arm, where the radial ray
+    runs along the face and reads a few pixels instead of the real
+    thickness; further along (beyond the end face) the reading is stable.
+    Inset points scale with the contour-run length so this works at any
+    image resolution. Returns the measurement dict whose thickness is the
+    median, or None when no point gave a reliable reading."""
+    n = len(run)
+    if n < 16:
+        return None
+    found = []
+    for frac in (0.07, 0.09, 0.11, 0.13):
+        i = max(1, int(n * frac))
+        pt = tuple(run[i] if from_start else run[-i - 1])
+        t = geometry.measure_tip_thickness(mask, pt, ref_center)
+        if t is not None:
+            found.append(t)
+    if not found:
+        return None
+    found.sort(key=lambda t: t["thickness_px"])
+    return found[len(found) // 2]
+
+
 def _fork_tip_geometry(part: DetectedPart) -> dict:
     """Computes the shared fork-geometry evidence once (tips, inner-arc
     fit, outer-arc fit, per-tip thickness) so every parameter that needs it
@@ -288,10 +339,8 @@ def _fork_tip_geometry(part: DetectedPart) -> dict:
         if arc_fit is not None:
             ref_center = (arc_fit["cx"], arc_fit["cy"])
             run = geometry._contour_run(part.contour, tips["start_idx"], tips["end_idx"])
-            inset = min(15, max(1, len(run) // 8))
-            if len(run) > 2 * inset:
-                thickness_a = geometry.measure_tip_thickness(part.mask, tuple(run[inset]), ref_center)
-                thickness_b = geometry.measure_tip_thickness(part.mask, tuple(run[-inset - 1]), ref_center)
+            thickness_a = _median_tip_thickness(part.mask, run, ref_center, from_start=True)
+            thickness_b = _median_tip_thickness(part.mask, run, ref_center, from_start=False)
     return {
         "tips": tips, "arc_fit": arc_fit, "convex_arc_fit": convex_arc_fit,
         "thickness_a": thickness_a, "thickness_b": thickness_b,

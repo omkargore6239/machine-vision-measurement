@@ -27,6 +27,7 @@ MAX_INTERIOR_STD = 22.0         # std dev WITHIN the interior; high = not a cons
                                  # (catches ring/stroke shapes like printed "O"/"0"/"Q"/"8" text,
                                  # whose outer boundary alone looks deceptively hole-like — see
                                  # `_local_contrast_and_uniformity`'s docstring)
+MAX_INTERIOR_ROBUST_SIGMA = 12.0  # IQR-based sigma; a small glint leaves this near 0, a text ring does not
 MIN_DARK_MAJORITY_FRACTION = 0.25  # if the interior is at least this dark-majority, a high
                                     # interior_std is treated as "real cavity + a highlight",
                                     # not "hollow ring" — see `_local_contrast_and_uniformity`.
@@ -177,8 +178,13 @@ def _fit_ellipse_safe(contour: np.ndarray) -> tuple[float, float, float, float, 
 
 def _local_contrast_and_uniformity(
     gray: np.ndarray, contour: np.ndarray, outer_mask: np.ndarray,
-) -> tuple[float, float, float]:
-    """Returns (contrast, interior_std, dark_majority_fraction).
+) -> tuple[float, float, float, float]:
+    """Returns (contrast, interior_std, dark_majority_fraction, robust_sigma).
+
+    `robust_sigma` = IQR / 1.349 of the interior: like `interior_std` but
+    immune to a small bright/dark glint covering <25% of the interior (a
+    backlit hole with a reflection on its wall), while a ring/stroke whose
+    ink covers >=25% of the filled area still reads high.
 
     `contrast` = |mean interior intensity - mean intensity of a thin ring
     just outside the candidate, still inside the part|. A real hole reads as
@@ -224,7 +230,7 @@ def _local_contrast_and_uniformity(
     ring_mask = cv2.bitwise_and(ring_mask, local_outer)
 
     if cv2.countNonZero(interior_mask) == 0 or cv2.countNonZero(ring_mask) == 0:
-        return 0.0, 255.0, 0.0
+        return 0.0, 255.0, 0.0, 255.0
 
     interior_vals = local_gray[interior_mask == 255].astype(np.float64)
     interior_mean = float(np.mean(interior_vals))
@@ -232,7 +238,9 @@ def _local_contrast_and_uniformity(
     dark_majority_fraction = float(np.mean(interior_vals < DARK_PIXEL_THRESHOLD))
     ring_mean = cv2.mean(local_gray, mask=ring_mask)[0]
     contrast = abs(interior_mean - ring_mean)
-    return contrast, interior_std, dark_majority_fraction
+    q25, q75 = np.percentile(interior_vals, [25, 75])
+    robust_sigma = float((q75 - q25) / 1.349)
+    return contrast, interior_std, dark_majority_fraction, robust_sigma
 
 
 def _boundary_edge_strength(grad_mag: np.ndarray, contour: np.ndarray) -> float:
@@ -306,6 +314,54 @@ def _smooth_contour_for_shape_metrics(contour: np.ndarray, epsilon_fraction: flo
     return smoothed if len(smoothed) >= 3 else contour
 
 
+def _refine_soft_edge_hole(gray: np.ndarray, contour: np.ndarray, grad_mag: np.ndarray) -> np.ndarray:
+    """Snaps a round hole candidate whose contour sits on a soft, blurred rim
+    (defocus / purple fringing around a backlit hole) onto the sharp
+    intensity edge inside it. Only acts when the original boundary is weak
+    (< MIN_EDGE_STRENGTH) AND round; the refined contour must itself be round,
+    concentric, a bit smaller, and have a clearly stronger edge -- otherwise
+    the original contour is returned untouched, so well-behaved holes and
+    every non-hole shape are unaffected."""
+    shape = _smooth_contour_for_shape_metrics(contour)
+    area = cv2.contourArea(shape)
+    perimeter = cv2.arcLength(shape, True)
+    if area <= 0 or perimeter <= 0 or 4 * math.pi * area / perimeter ** 2 < 0.9:
+        return contour
+    if _boundary_edge_strength(grad_mag, contour) >= MIN_EDGE_STRENGTH:
+        return contour
+
+    x, y, w, h = cv2.boundingRect(contour)
+    H, W = gray.shape
+    pad = max(4, int(0.15 * max(w, h)))
+    x0, y0, x1, y1 = max(0, x - pad), max(0, y - pad), min(W, x + w + pad), min(H, y + h + pad)
+    local = gray[y0:y1, x0:x1]
+    _, binary = cv2.threshold(local, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    M = cv2.moments(contour)
+    if M["m00"] <= 0:
+        return contour
+    cx, cy = int(M["m10"] / M["m00"]) - x0, int(M["m01"] / M["m00"]) - y0
+    if not (0 <= cx < binary.shape[1] and 0 <= cy < binary.shape[0]):
+        return contour
+    n, labels = cv2.connectedComponents(binary if binary[cy, cx] else cv2.bitwise_not(binary))
+    if labels[cy, cx] == 0:
+        return contour
+    comp = (labels == labels[cy, cx]).astype(np.uint8) * 255
+    found, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not found:
+        return contour
+    refined = max(found, key=cv2.contourArea) + np.array([[[x0, y0]]])
+    r_shape = _smooth_contour_for_shape_metrics(refined)
+    r_area = cv2.contourArea(r_shape)
+    r_perim = cv2.arcLength(r_shape, True)
+    if r_area <= 0 or r_perim <= 0 or not (0.5 * area <= r_area <= 0.98 * area):
+        return contour
+    if 4 * math.pi * r_area / r_perim ** 2 < 0.9:
+        return contour
+    if _boundary_edge_strength(grad_mag, refined) < 2 * _boundary_edge_strength(grad_mag, contour):
+        return contour
+    return refined
+
+
 def evaluate_hole_candidates(
     gray: np.ndarray,
     outer_mask: np.ndarray,
@@ -338,6 +394,7 @@ def evaluate_hole_candidates(
     results: list[HoleCandidate] = []
 
     for c in hole_contours:
+        c = _refine_soft_edge_hole(gray, c, grad_mag)
         # Shape metrics (circularity/solidity/aspect/equiv-diameter/centroid)
         # are computed from a lightly smoothed copy of the contour — see
         # `_smooth_contour_for_shape_metrics`'s docstring for why. Interior
@@ -367,7 +424,7 @@ def evaluate_hole_candidates(
         else:
             cx, cy = ecx, ecy
 
-        contrast, interior_std, dark_majority_fraction = _local_contrast_and_uniformity(gray, c, outer_mask)
+        contrast, interior_std, dark_majority_fraction, robust_sigma = _local_contrast_and_uniformity(gray, c, outer_mask)
         edge_strength = _boundary_edge_strength(grad_mag, c)
 
         hough_confirmed = False
@@ -392,7 +449,11 @@ def evaluate_hole_candidates(
             reasons.append(f"Too elongated (aspect ratio {aspect_ratio:.2f} > {MAX_ASPECT_RATIO:.2f})")
         if contrast < MIN_CONTRAST:
             reasons.append(f"Weak contrast vs surrounding material ({contrast:.1f} < {MIN_CONTRAST:.1f})")
-        if interior_std > MAX_INTERIOR_STD and dark_majority_fraction < MIN_DARK_MAJORITY_FRACTION:
+        # A backlit hole with a small wall reflection inflates the plain std
+        # but not the robust (IQR) sigma -- only trust the plain std when the
+        # robust sigma agrees the interior really isn't one consistent surface.
+        if (interior_std > MAX_INTERIOR_STD and robust_sigma > MAX_INTERIOR_ROBUST_SIGMA
+                and dark_majority_fraction < MIN_DARK_MAJORITY_FRACTION):
             # High variance alone doesn't distinguish a real cavity with an
             # internal highlight from a hollow ring/stroke — both can have
             # it. What tells them apart is whether dark pixels are still the

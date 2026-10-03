@@ -38,3 +38,10 @@ def test_mapping_values_are_only_confirmed_or_assumed():
     for recipe in SHIFTER_FORK_RECIPES.values():
         for attr in recipe.attributes:
             assert attr.mapping in ("confirmed", "assumed")
+
+
+def test_side_view_rows_are_present_and_never_decide_the_verdict():
+    for recipe in SHIFTER_FORK_RECIPES.values():
+        side = [a for a in recipe.attributes if a.needs_view]
+        assert {a.feature for a in side} == {"cross_hole_5h10", "pad_thickness", "tip_thickness_side"}
+        assert all(a.in_verdict is False for a in side)

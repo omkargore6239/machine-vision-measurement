@@ -34,7 +34,7 @@ from tests.fixtures import make_shifter_fork_part
 from vision import geometry, segmentation
 from vision.preprocessing import to_gray
 from vision.shifter_fork_geometry import ShifterForkLandmarks, extract_shifter_fork_landmarks
-from vision.shifter_fork_measurement import evaluate_shifter_fork
+from vision.shifter_fork_measurement import SIDE_VIEW_FEATURES, evaluate_shifter_fork
 from vision.shifter_fork_recipes import SHIFTER_FORK_RECIPES
 from vision.types import CalibrationProfile, CircleFeature
 
@@ -159,7 +159,7 @@ def test_every_attribute_is_evaluated_and_reported(recipe_id):
     results, _, _ = evaluate_shifter_fork(landmarks, recipe, _profile())
     assert len(results) == len(recipe.attributes)
     for r in results:
-        assert r.status in ("PASS", "FAIL", "INCOMPLETE", "NOT DETECTED")
+        assert r.status in ("PASS", "FAIL", "INCOMPLETE", "NOT DETECTED", "NEEDS SIDE VIEW")
 
 
 @pytest.mark.parametrize("recipe_id", list(SHIFTER_FORK_RECIPES))
@@ -231,7 +231,8 @@ def test_reject_true_when_landmarks_have_a_hard_failure():
     # every row reports the same hard-failure reason, not a fabricated value
     for r in results:
         assert r.measured_mm is None
-        assert r.status == "NOT DETECTED"
+        # side-view-only rows are never "detected" from the top view at all
+        assert r.status == ("NEEDS SIDE VIEW" if r.feature in SIDE_VIEW_FEATURES else "NOT DETECTED")
 
 
 def test_reject_true_when_no_calibration_active():

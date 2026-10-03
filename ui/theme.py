@@ -415,6 +415,116 @@ table.mv-table tr.mv-row-selected td {{ background: {COLOR_INFO_BG}; }}
     from {{ opacity: 0; transform: scale(0.9); }}
     to {{ opacity: 1; transform: scale(1); }}
 }}
+
+/* =====================  MODERN PRO SKIN (overrides above)  ===================== */
+#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] {{ visibility: hidden; height: 0; }}
+header[data-testid="stHeader"] {{ background: transparent; }}
+
+.stApp {{
+    background:
+        radial-gradient(900px 400px at 85% -10%, rgba(99,102,241,0.10), transparent 60%),
+        radial-gradient(700px 360px at -5% 0%, rgba(14,165,233,0.08), transparent 60%),
+        #F4F6FB;
+}}
+.block-container {{ padding-top: 2rem; max-width: 1280px; }}
+
+/* Title */
+h1 {{
+    font-size: 1.9rem !important;
+    background: linear-gradient(90deg, #0F172A 0%, #4338CA 100%);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent; color: transparent !important;
+    letter-spacing: -0.02em;
+}}
+h2 {{ font-size: 1.35rem !important; }}
+
+/* Dark sidebar */
+section[data-testid="stSidebar"] {{
+    background: linear-gradient(180deg, #0B1220 0%, #111A2E 100%);
+    border-right: none;
+}}
+section[data-testid="stSidebar"] * {{ color: #CBD5E1; }}
+section[data-testid="stSidebar"] .stButton > button {{
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.10);
+    color: #E2E8F0; border-radius: 10px; font-weight: 600;
+}}
+section[data-testid="stSidebar"] .stButton > button:hover {{
+    background: rgba(99,102,241,0.25); border-color: #818CF8; color: #FFFFFF;
+}}
+section[data-testid="stSidebar"] [data-testid="stExpander"] {{
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 10px;
+}}
+section[data-testid="stSidebar"] hr {{ border-color: rgba(255,255,255,0.10); }}
+
+/* Buttons */
+.stButton > button {{
+    border-radius: 10px; padding: 0.5rem 1rem; font-weight: 600;
+    border: 1px solid #E2E8F0; box-shadow: 0 1px 2px rgba(15,23,42,0.05);
+    transition: all 0.18s ease;
+}}
+.stButton > button:hover {{
+    border-color: #6366F1; color: #4338CA;
+    box-shadow: 0 6px 16px rgba(99,102,241,0.18); transform: translateY(-1px);
+}}
+.stButton > button[kind="primary"] {{
+    background: linear-gradient(135deg, #4F46E5 0%, #6366F1 55%, #0EA5E9 100%);
+    color: #fff; border: none; box-shadow: 0 6px 18px rgba(79,70,229,0.35);
+}}
+.stButton > button[kind="primary"]:hover {{
+    background: linear-gradient(135deg, #4338CA 0%, #4F46E5 55%, #0284C7 100%);
+    color: #fff; box-shadow: 0 10px 24px rgba(79,70,229,0.45);
+}}
+
+/* Cards: bordered containers, panels, expanders, uploader */
+[data-testid="stVerticalBlockBorderWrapper"] {{
+    background: #FFFFFF; border: 1px solid #E5E9F2 !important;
+    border-radius: 16px !important; box-shadow: 0 4px 24px rgba(15,23,42,0.05);
+}}
+.mv-panel, .mv-side-panel {{
+    border-radius: 14px; border: 1px solid #E5E9F2;
+    box-shadow: 0 4px 20px rgba(15,23,42,0.05);
+}}
+[data-testid="stExpander"] {{
+    border-radius: 12px; border: 1px solid #E5E9F2; background: #FFFFFF;
+}}
+[data-testid="stFileUploader"] section {{
+    border: 2px dashed #A5B4FC; background: rgba(238,242,255,0.6); border-radius: 16px;
+}}
+[data-testid="stFileUploader"] section:hover {{ border-color: #6366F1; background: rgba(238,242,255,0.95); }}
+[data-testid="stAlert"] {{ border-radius: 12px; border: none; }}
+[data-testid="stStatusWidget"], [data-testid="stStatus"] {{ border-radius: 12px; }}
+
+/* Step bar as segmented pills */
+.st-key-mv_steps .stButton > button {{
+    border-radius: 999px; padding: 0.55rem 1rem; font-weight: 700;
+    background: #FFFFFF; border: 1px solid #E2E8F0; color: #475569;
+}}
+.st-key-mv_steps .stButton > button[kind="primary"] {{ color: #fff; }}
+
+/* Hero banner (verdict) */
+.mv-hero {{
+    border-radius: 18px; padding: 28px 24px; border: none;
+    box-shadow: 0 10px 30px rgba(15,23,42,0.08);
+}}
+.mv-hero-title {{ font-size: 2.4rem; letter-spacing: 0.04em; }}
+.mv-hero-pass {{ background: linear-gradient(135deg, #DCFCE7 0%, #ECFDF5 100%); box-shadow: 0 10px 30px rgba(22,163,74,0.18); }}
+.mv-hero-fail {{ background: linear-gradient(135deg, #FEE2E2 0%, #FFF1F2 100%); box-shadow: 0 10px 30px rgba(220,38,38,0.18); }}
+.mv-hero-incomplete {{ background: linear-gradient(135deg, #FEF3C7 0%, #FFFBEB 100%); }}
+.mv-hero-neutral {{ background: linear-gradient(135deg, #EEF2FF 0%, #F8FAFC 100%); }}
+
+/* Tables */
+table.mv-table {{ border-collapse: separate; border-spacing: 0; overflow: hidden; border-radius: 12px; }}
+table.mv-table th {{ background: #F1F5F9; color: #475569; padding: 10px 12px; }}
+table.mv-table td {{ padding: 10px 12px; }}
+table.mv-table tr:hover td {{ background: #F8FAFF; }}
+.mv-chip {{ border-radius: 999px; background: #EEF2FF; color: #4338CA; border-color: #C7D2FE; padding: 3px 12px; }}
+.mv-badge {{ border-radius: 999px; }}
+
+/* Tabs */
+button[data-baseweb="tab"][aria-selected="true"] {{ color: #4338CA; }}
+div[data-baseweb="tab-highlight"] {{ background-color: #6366F1 !important; height: 3px; border-radius: 3px; }}
 </style>
 """
 

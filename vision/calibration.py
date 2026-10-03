@@ -115,6 +115,34 @@ def known_dimension_calibrate(
     )
 
 
+def known_feature_calibrate(
+    feature_diameter_px: float, known_mm: float, image_size: tuple[int, int], name: str = "",
+) -> CalibrationProfile:
+    """Scale from a round feature of known diameter that is ON the part (e.g.
+    its drilled hole), measured at the app's processing resolution. Same
+    plane as the part by construction, so no reference/part height mismatch.
+    `image_size` is the (H, W) of the processed image the pixels came from."""
+    if known_mm <= 0:
+        raise ValueError("Known feature diameter must be greater than zero.")
+    if feature_diameter_px <= 0:
+        raise ValueError("Detected feature has zero size - cannot calibrate.")
+    return CalibrationProfile(
+        profile_id=_new_id(),
+        name=name or f"Known hole {known_mm:g}mm",
+        method="known_dimension",
+        created_at=_now_iso(),
+        confidence=CONFIDENCE_MEDIUM,
+        notes=[
+            f"Scale from a detected round feature: {feature_diameter_px:.1f}px = {known_mm:.3f}mm.",
+            "Assumes isotropic scale, a fronto-parallel camera, and the same camera/lens/height for later photos.",
+        ],
+        reference_image_size=image_size,
+        mm_per_pixel=known_mm / feature_diameter_px,
+        known_mm=known_mm,
+        detected_pixels=float(feature_diameter_px),
+    )
+
+
 # --------------------------------------------------------------------------------
 # Method B: checkerboard
 # --------------------------------------------------------------------------------

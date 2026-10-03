@@ -25,6 +25,7 @@ class ShifterForkAttribute:
     mapping: str  # "confirmed" | "assumed"
     unit: str = "mm"  # "mm" | "deg"
     in_verdict: bool = True  # False forces info-only regardless of mapping
+    needs_view: str = ""     # non-empty -> not measurable from the top view (e.g. "side view"); never judged
 
 
 @dataclass
@@ -32,6 +33,23 @@ class ShifterForkRecipe:
     part_number: str
     title: str
     attributes: list[ShifterForkAttribute] = field(default_factory=list)
+
+
+def _side_view_attributes(thickness_nominal: float) -> list[ShifterForkAttribute]:
+    """MAJOR characteristics on every fork drawing that are only visible in
+    the side/section views (B-B / D-D / Detail B), never in a top-down photo.
+    Listed so they are not silently forgotten; they stay "NEEDS SIDE VIEW"
+    until a side camera or gauge result is available, and never affect the
+    accept/reject verdict."""
+    t = thickness_nominal
+    return [
+        ShifterForkAttribute("cross_hole_5h10", "Cross Hole Diameter", "Ø5 H10 (+0.048/0), thru",
+                              5.0, 5.0, 5.048, "confirmed", in_verdict=False, needs_view="side view"),
+        ShifterForkAttribute("pad_thickness", "Pad Thickness", f"{t:g} ±0.05",
+                              t, t - 0.05, t + 0.05, "confirmed", in_verdict=False, needs_view="side view"),
+        ShifterForkAttribute("tip_thickness_side", "Tip Thickness (Detail B)", "7.4 ±0.1",
+                              7.4, 7.3, 7.5, "confirmed", in_verdict=False, needs_view="side view"),
+    ]
 
 
 SHIFTER_FORK_RECIPES: dict[str, ShifterForkRecipe] = {
@@ -57,7 +75,7 @@ SHIFTER_FORK_RECIPES: dict[str, ShifterForkRecipe] = {
                                   28.4, 28.067, 28.733, "assumed", unit="°"),
             ShifterForkAttribute("bore_diameter", "Bore Diameter", "Ø14 H7",
                                   14.0, 14.0, 14.018, "confirmed", in_verdict=False),
-        ],
+        ] + _side_view_attributes(13.0),
     ),
     "OP-T02-023-A-00-010": ShifterForkRecipe(
         part_number="OP-T02-023-A-00-010",
@@ -81,7 +99,7 @@ SHIFTER_FORK_RECIPES: dict[str, ShifterForkRecipe] = {
                                   87.0, 87.0, 87.5, "assumed"),
             ShifterForkAttribute("bore_diameter", "Bore Diameter", "Ø14 H7",
                                   14.0, 14.0, 14.018, "confirmed", in_verdict=False),
-        ],
+        ] + _side_view_attributes(12.7),
     ),
     "OP-T02-015-A-00-010": ShifterForkRecipe(
         part_number="OP-T02-015-A-00-010",
@@ -109,6 +127,6 @@ SHIFTER_FORK_RECIPES: dict[str, ShifterForkRecipe] = {
                                   62.0, 61.0, 63.0, "assumed"),
             ShifterForkAttribute("bore_diameter", "Bore Diameter", "Ø14 H7",
                                   14.0, 14.0, 14.018, "confirmed", in_verdict=False),
-        ],
+        ] + _side_view_attributes(12.7),
     ),
 }
